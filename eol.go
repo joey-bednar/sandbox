@@ -6,7 +6,13 @@
 //
 // Usage:
 //
-//	go run eol.go services.yaml
+//	go run eol.go services.yaml [report.md]
+//
+// The results are written to a Markdown file (default report.md) as a
+// table with the service, current version, whether it is the latest version
+// (✅, or ❌ and the latest version), and whether it is supported (✅, ❌, or
+// ❔ when unknown). Services that couldn't be checked show ⚠️ and their error
+// is listed under the table.
 //
 // YAML format:
 //
@@ -59,11 +65,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"text/tabwriter"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
+
+const defaultReportPath = "report.md"
 
 const eolAPIBase = "https://endoflife.date/api/"
 
@@ -181,9 +188,13 @@ func limit[T any](c *checker, fn func() (T, error)) (T, error) {
 }
 
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Fprintf(os.Stderr, "usage: %s <services.yaml>\n", os.Args[0])
+	if len(os.Args) < 2 || len(os.Args) > 3 {
+		fmt.Fprintf(os.Stderr, "usage: %s <services.yaml> [report.md]\n", os.Args[0])
 		os.Exit(2)
+	}
+	outPath := defaultReportPath
+	if len(os.Args) == 3 {
+		outPath = os.Args[2]
 	}
 
 	cfg, err := loadConfig(os.Args[1])
@@ -204,7 +215,7 @@ func main() {
 	}
 	wg.Wait()
 
-	os.Exit(report(results))
+	os.Exit(report(results, outPath))
 }
 
 // loadConfig reads and validates the YAML file.
@@ -339,10 +350,13 @@ func errResult(svc Service, source string, err error) Result {
 	return Result{Service: svc, Source: source, Status: StatusError, Err: err}
 }
 
-// report prints a table of results followed by any errors, and returns the exit code.
-func report(results []Result) int {
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "SERVICE\tVERSION\tSOURCE\tLATEST\tSTATUS")
+// report writes a Markdown table of results to path and returns the exit code.
+func report(results []Result, path string) int {
+	var b strings.Builder
+	b.WriteString("# End of life report\n\n")
+	fmt.Fprintf(&b, "Generated %s\n\n", time.Now().UTC().Format("2006-01-02 15:04 MST"))
+	b.WriteString("| Service | Current version | Is latest | Is supported |\n")
+	b.WriteString("|---|---|---|---|\n")
 
 	counts := map[string]int{}
 	var errLines []string
@@ -350,28 +364,24 @@ func report(results []Result) int {
 	for _, r := range results {
 		counts[r.Status]++
 		if r.Err != nil {
-			errLines = append(errLines, fmt.Sprintf("  %s %s: %v", r.Service.Name, r.Service.Version, r.Err))
+			errLines = append(errLines, fmt.Sprintf("- **%s %s**: %v", mdEscape(r.Service.Name), mdEscape(r.Service.Version), mdEscape(r.Err.Error())))
 		}
-
-		latest := dash(r.Latest)
-		if r.Newer {
-			latest += " (newer available)"
-		}
-
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
-			r.Service.Name, r.Service.Version, r.Source, latest, r.Status)
+		fmt.Fprintf(&b, "| %s | %s | %s | %s |\n",
+			mdEscape(r.Service.Name), mdEscape(r.Service.Version), latestCell(r), supportedCell(r))
 	}
-	w.Flush()
 
 	if len(errLines) > 0 {
-		fmt.Fprintln(os.Stderr, "\nErrors:")
-		for _, l := range errLines {
-			fmt.Fprintln(os.Stderr, l)
-		}
+		b.WriteString("\n## Errors\n\n")
+		b.WriteString(strings.Join(errLines, "\n"))
+		b.WriteString("\n")
 	}
 
-	fmt.Printf("\n%d checked: %d supported, %d unsupported, %d unknown, %d errors\n",
-		len(results), counts[StatusSupported], counts[StatusUnsupported],
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "error: writing %s: %v\n", path, err)
+		return 2
+	}
+	fmt.Printf("Wrote %s (%d checked: %d supported, %d unsupported, %d unknown, %d errors)\n",
+		path, len(results), counts[StatusSupported], counts[StatusUnsupported],
 		counts[StatusUnknown], counts[StatusError])
 
 	switch {
@@ -382,6 +392,37 @@ func report(results []Result) int {
 	default:
 		return 0
 	}
+}
+
+// latestCell is ✅ when the version is the latest, otherwise ❌ and the latest version.
+func latestCell(r Result) string {
+	switch {
+	case r.Status == StatusError:
+		return "-"
+	case r.Newer:
+		return "❌ " + mdEscape(dash(r.Latest))
+	default:
+		return "✅"
+	}
+}
+
+func supportedCell(r Result) string {
+	switch r.Status {
+	case StatusSupported:
+		return "✅"
+	case StatusUnsupported:
+		return "❌"
+	case StatusUnknown:
+		return "❔"
+	default:
+		return "⚠️"
+	}
+}
+
+// mdEscape keeps text from breaking out of a Markdown table cell.
+func mdEscape(s string) string {
+	s = strings.ReplaceAll(s, "|", "\\|")
+	return strings.ReplaceAll(s, "\n", " ")
 }
 
 func dash(s string) string {
