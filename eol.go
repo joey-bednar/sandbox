@@ -25,10 +25,20 @@
 // GitHub requests are unauthenticated, so only public repos can be checked,
 // and GitHub allows 60 requests/hour per IP address.
 //
-// All services are checked concurrently (one goroutine each). Duplicate
-// lookups are shared, so a product or repo listed several times is fetched
-// once, and at most maxConcurrentRequests HTTP requests are in flight at a time.
-// Output order always matches the YAML file.
+// All services are checked concurrently (one goroutine each), with at most
+// maxConcurrentRequests HTTP requests in flight at a time. Output order always
+// matches the YAML file.
+//
+// MinIO is a special case: set "minio: true" on a service to skip
+// endoflife.date and instead scrape the stable release list published at
+// https://dl.minio.io/releases (edge builds are ignored). The version is a
+// MinIO release tag such as "RELEASE.2025-03-12T18-04-18Z" (the "RELEASE."
+// prefix is optional). Like GitHub results, these are reported as UNKNOWN.
+//
+//	services:
+//	  - name: minio
+//	    version: "RELEASE.2025-03-12T18-04-18Z"
+//	    minio: true
 //
 // Exit codes: 0 = nothing end of life, 1 = at least one end of life,
 // 2 = at least one error (unknown product with no fallback, network failure).
@@ -40,10 +50,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,6 +66,11 @@ import (
 )
 
 const eolAPIBase = "https://endoflife.date/api/"
+
+// minioNotesURL is the directory listing the https://dl.minio.io/releases page
+// reads (client-side) to build its list. It holds one release-notes file per
+// stable release; edge builds live under a separate /edge/ path.
+const minioNotesURL = "https://dl.minio.io/aistor/minio/release/notes/"
 
 // maxConcurrentRequests caps simultaneous HTTP requests across all goroutines,
 // which keeps large service lists from tripping GitHub's secondary rate limits.
@@ -67,6 +84,7 @@ const (
 
 	SourceEOL    = "endoflife.date"
 	SourceGitHub = "github"
+	SourceMinIO  = "dl.minio.io"
 )
 
 // errNoEOLProduct means endoflife.date has no endpoint for the product,
@@ -83,6 +101,7 @@ type Service struct {
 	Name    string `yaml:"name"`
 	Version string `yaml:"version"`
 	GitHub  string `yaml:"github"` // optional fallback, e.g. https://github.com/owner/repo
+	MinIO   bool   `yaml:"minio"`  // scrape stable releases from dl.minio.io instead of endoflife.date
 }
 
 // flexString accepts a JSON string or number and keeps its literal text,
@@ -135,44 +154,11 @@ type Result struct {
 	Err     error
 }
 
-// memo is a concurrency-safe, per-key fetch cache. The first goroutine to ask
-// for a key runs the fetch; any others asking for the same key at the same
-// time block until it finishes and share its result instead of re-fetching.
-type memo[T any] struct {
-	mu sync.Mutex
-	m  map[string]*memoEntry[T]
-}
-
-type memoEntry[T any] struct {
-	once sync.Once
-	val  T
-	err  error
-}
-
-func newMemo[T any]() *memo[T] {
-	return &memo[T]{m: map[string]*memoEntry[T]{}}
-}
-
-func (m *memo[T]) get(key string, fetch func() (T, error)) (T, error) {
-	m.mu.Lock()
-	e, ok := m.m[key]
-	if !ok {
-		e = &memoEntry[T]{}
-		m.m[key] = e
-	}
-	m.mu.Unlock()
-
-	e.once.Do(func() { e.val, e.err = fetch() })
-	return e.val, e.err
-}
-
-// checker holds the shared HTTP client, a semaphore limiting concurrent
-// requests, and the caches. It is safe for concurrent use.
+// checker holds the shared HTTP client and a semaphore limiting concurrent
+// requests. It is safe for concurrent use.
 type checker struct {
 	client *http.Client
 	sem    chan struct{}
-	eol    *memo[[]Cycle]
-	gh     *memo[[]ghRelease]
 }
 
 func newChecker() *checker {
@@ -184,8 +170,6 @@ func newChecker() *checker {
 	return &checker{
 		client: &http.Client{Timeout: 15 * time.Second, Transport: transport},
 		sem:    make(chan struct{}, maxConcurrentRequests),
-		eol:    newMemo[[]Cycle](),
-		gh:     newMemo[[]ghRelease](),
 	}
 }
 
@@ -250,6 +234,10 @@ func (c *checker) check(svc Service) Result {
 	svc.Name = strings.ToLower(strings.TrimSpace(svc.Name))
 	svc.Version = strings.TrimPrefix(strings.TrimSpace(svc.Version), "v")
 	svc.GitHub = strings.TrimSpace(svc.GitHub)
+
+	if svc.MinIO {
+		return c.checkMinIO(svc)
+	}
 
 	cycles, err := c.cycles(svc.Name)
 	switch {
@@ -323,6 +311,30 @@ func (c *checker) checkGitHub(svc Service) Result {
 	}
 }
 
+// checkMinIO compares the version against the newest stable MinIO release.
+// The status is always UNKNOWN: the release list says nothing about support.
+func (c *checker) checkMinIO(svc Service) Result {
+	current := normalizeMinIOVersion(svc.Version)
+	if !minioVersionRe.MatchString(current) {
+		return errResult(svc, SourceMinIO,
+			fmt.Errorf("%q is not a MinIO release version (expected e.g. RELEASE.2025-03-12T18-04-18Z)", svc.Version))
+	}
+
+	versions, err := c.minioReleases()
+	if err != nil {
+		return errResult(svc, SourceMinIO, err)
+	}
+
+	latest := versions[0] // sorted newest first, never empty
+	return Result{
+		Service: svc,
+		Source:  SourceMinIO,
+		Latest:  latest,
+		Newer:   latest > current, // timestamps sort lexicographically
+		Status:  StatusUnknown,
+	}
+}
+
 func errResult(svc Service, source string, err error) Result {
 	return Result{Service: svc, Source: source, Status: StatusError, Err: err}
 }
@@ -382,9 +394,7 @@ func dash(s string) string {
 // ---- endoflife.date ----
 
 func (c *checker) cycles(product string) ([]Cycle, error) {
-	return c.eol.get(product, func() ([]Cycle, error) {
-		return limit(c, func() ([]Cycle, error) { return fetchCycles(c.client, product) })
-	})
+	return limit(c, func() ([]Cycle, error) { return fetchCycles(c.client, product) })
 }
 
 func fetchCycles(client *http.Client, product string) ([]Cycle, error) {
@@ -490,9 +500,7 @@ func githubReleasesURL(ref string) (string, error) {
 }
 
 func (c *checker) releases(apiURL string) ([]ghRelease, error) {
-	return c.gh.get(apiURL, func() ([]ghRelease, error) {
-		return limit(c, func() ([]ghRelease, error) { return fetchReleases(c.client, apiURL) })
-	})
+	return limit(c, func() ([]ghRelease, error) { return fetchReleases(c.client, apiURL) })
 }
 
 func fetchReleases(client *http.Client, apiURL string) ([]ghRelease, error) {
@@ -600,4 +608,57 @@ func isNewer(candidate, current string) bool {
 		return candidate != current
 	}
 	return compareVersions(a, b) > 0
+}
+
+// ---- MinIO releases ----
+
+// minioVersionRe matches a stable MinIO release tag. Edge builds are tagged
+// "EDGE.<timestamp>" and deliberately never match.
+var minioVersionRe = regexp.MustCompile(`^RELEASE\.\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z$`)
+
+// minioNotesRe finds stable release tags in the release-notes directory listing.
+var minioNotesRe = regexp.MustCompile(`release-notes-(RELEASE\.\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)\.md`)
+
+// normalizeMinIOVersion lets users write the bare timestamp, with or without
+// the "RELEASE." prefix.
+func normalizeMinIOVersion(v string) string {
+	if !strings.HasPrefix(strings.ToUpper(v), "RELEASE.") {
+		return "RELEASE." + v
+	}
+	return "RELEASE." + v[len("RELEASE."):]
+}
+
+// minioReleases returns all stable release tags, newest first.
+func (c *checker) minioReleases() ([]string, error) {
+	return limit(c, func() ([]string, error) { return fetchMinIOReleases(c.client) })
+}
+
+func fetchMinIOReleases(client *http.Client) ([]string, error) {
+	resp, err := client.Get(minioNotesURL)
+	if err != nil {
+		return nil, fmt.Errorf("dl.minio.io request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("dl.minio.io returned %s", resp.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if err != nil {
+		return nil, fmt.Errorf("reading dl.minio.io response: %w", err)
+	}
+
+	seen := map[string]bool{}
+	var versions []string
+	for _, m := range minioNotesRe.FindAllSubmatch(body, -1) {
+		if v := string(m[1]); !seen[v] {
+			seen[v] = true
+			versions = append(versions, v)
+		}
+	}
+	if len(versions) == 0 {
+		return nil, errors.New("no stable releases found on dl.minio.io (page layout may have changed)")
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(versions)))
+	return versions, nil
 }

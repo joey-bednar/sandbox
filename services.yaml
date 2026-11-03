@@ -8,3 +8,6 @@ services:
   - name: trivy
     version: "0.56.0"
     github: https://github.com/aquasecurity/trivy
+  - name: minio
+    version: "RELEASE.2025-03-12T18-04-18Z"
+    minio: true
