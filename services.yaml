@@ -1,6 +1,8 @@
 services:
   - name: keycloak
-    version: "26.0.5"
+    version_from:
+      file: release.env
+      var: UPSTREAM_VERSION
   - name: python
     version: "3.10.4"
   - name: postgresql

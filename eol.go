@@ -23,6 +23,19 @@
 //	    version: "0.56.0"
 //	    github: https://github.com/aquasecurity/trivy
 //
+// Instead of a literal "version", a service can read it from a variable in an
+// env file (KEY=value lines, as in a .env file):
+//
+//	services:
+//	  - name: keycloak
+//	    version_from:
+//	      file: release.env
+//	      var: UPSTREAM_VERSION
+//
+// The file path is relative to the YAML file. Set exactly one of "version" and
+// "version_from". Supported env syntax: blank lines, # comments, an optional
+// "export " prefix, and single- or double-quoted values.
+//
 // "name" should be an endoflife.date product slug
 // (https://endoflife.date/api/all.json). "github" is optional and is only used
 // when endoflife.date has no entry for the product. It can be a full URL, a
@@ -60,12 +73,15 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	_ "time/tzdata" // embed zone data so America/Los_Angeles loads on any system
 
 	"gopkg.in/yaml.v3"
 )
@@ -107,8 +123,16 @@ type Config struct {
 type Service struct {
 	Name    string `yaml:"name"`
 	Version string `yaml:"version"`
-	GitHub  string `yaml:"github"` // optional fallback, e.g. https://github.com/owner/repo
-	MinIO   bool   `yaml:"minio"`  // scrape stable releases from dl.minio.io instead of endoflife.date
+	// VersionFrom reads the version from a variable in an env file instead.
+	VersionFrom *VersionFrom `yaml:"version_from"`
+	GitHub      string       `yaml:"github"` // optional fallback, e.g. https://github.com/owner/repo
+	MinIO       bool         `yaml:"minio"`  // scrape stable releases from dl.minio.io instead of endoflife.date
+}
+
+// VersionFrom points at a variable in an env file.
+type VersionFrom struct {
+	File string `yaml:"file"`
+	Var  string `yaml:"var"`
 }
 
 // flexString accepts a JSON string or number and keeps its literal text,
@@ -232,12 +256,74 @@ func loadConfig(path string) (*Config, error) {
 	if len(cfg.Services) == 0 {
 		return nil, fmt.Errorf("%s: no services listed under 'services:'", path)
 	}
-	for i, s := range cfg.Services {
-		if strings.TrimSpace(s.Name) == "" || strings.TrimSpace(s.Version) == "" {
-			return nil, fmt.Errorf("%s: service #%d needs both 'name' and 'version'", path, i+1)
+	baseDir := filepath.Dir(path)
+	for i := range cfg.Services {
+		s := &cfg.Services[i]
+		hasVersion := strings.TrimSpace(s.Version) != ""
+		if strings.TrimSpace(s.Name) == "" {
+			return nil, fmt.Errorf("%s: service #%d needs a 'name'", path, i+1)
+		}
+		switch {
+		case hasVersion && s.VersionFrom != nil:
+			return nil, fmt.Errorf("%s: service #%d (%s) sets both 'version' and 'version_from'", path, i+1, s.Name)
+		case s.VersionFrom != nil:
+			v, err := versionFromEnv(baseDir, *s.VersionFrom)
+			if err != nil {
+				return nil, fmt.Errorf("%s: service #%d (%s): %w", path, i+1, s.Name, err)
+			}
+			s.Version = v
+		case !hasVersion:
+			return nil, fmt.Errorf("%s: service #%d (%s) needs a 'version' or 'version_from'", path, i+1, s.Name)
 		}
 	}
 	return &cfg, nil
+}
+
+// versionFromEnv reads vf.Var from the env file vf.File, resolved against baseDir.
+func versionFromEnv(baseDir string, vf VersionFrom) (string, error) {
+	if vf.File == "" || vf.Var == "" {
+		return "", errors.New("'version_from' needs both 'file' and 'var'")
+	}
+	path := vf.File
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(baseDir, path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("reading env file: %w", err)
+	}
+	val, ok := parseEnv(string(data))[vf.Var]
+	if !ok {
+		return "", fmt.Errorf("variable %s not found in %s", vf.Var, path)
+	}
+	if strings.TrimSpace(val) == "" {
+		return "", fmt.Errorf("variable %s in %s is empty", vf.Var, path)
+	}
+	return val, nil
+}
+
+// parseEnv parses KEY=value lines. Later assignments override earlier ones.
+func parseEnv(content string) map[string]string {
+	vars := map[string]string{}
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key, val = strings.TrimSpace(key), strings.TrimSpace(val)
+		if q := val[:min(1, len(val))]; (q == `"` || q == "'") && strings.Contains(val[1:], q) {
+			val = val[1 : 1+strings.Index(val[1:], q)] // quoted: ignore anything after the closing quote
+		} else if i := strings.Index(val, " #"); i >= 0 {
+			val = strings.TrimSpace(val[:i]) // inline comment on an unquoted value
+		}
+		vars[key] = val
+	}
+	return vars
 }
 
 // check looks up one service: endoflife.date first, GitHub releases as a fallback.
@@ -354,7 +440,7 @@ func errResult(svc Service, source string, err error) Result {
 func report(results []Result, path string) int {
 	var b strings.Builder
 	b.WriteString("# End of life report\n\n")
-	fmt.Fprintf(&b, "Generated %s\n\n", time.Now().UTC().Format("2006-01-02 15:04 MST"))
+	fmt.Fprintf(&b, "Generated %s\n\n", time.Now().In(pacific()).Format("01/02/2006 15:04 MST"))
 	b.WriteString("| Service | Current version | Is latest | Is supported |\n")
 	b.WriteString("|---|---|---|---|\n")
 
@@ -369,6 +455,10 @@ func report(results []Result, path string) int {
 		fmt.Fprintf(&b, "| %s | %s | %s | %s |\n",
 			mdEscape(r.Service.Name), mdEscape(r.Service.Version), latestCell(r), supportedCell(r))
 	}
+
+	b.WriteString("\n**Legend**\n\n")
+	b.WriteString("- **Is latest:** ✅ running the latest version; ❌ a newer version exists (shown)\n")
+	b.WriteString("- **Is supported:** ✅ supported; ❌ end of life; ❔ unknown (no support data available for this source); ⚠️ could not be checked (see Errors)\n")
 
 	if len(errLines) > 0 {
 		b.WriteString("\n## Errors\n\n")
@@ -392,6 +482,15 @@ func report(results []Result, path string) int {
 	default:
 		return 0
 	}
+}
+
+// pacific returns the US Pacific time zone (PST in winter, PDT in summer).
+func pacific() *time.Location {
+	loc, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		return time.FixedZone("PST", -8*60*60)
+	}
+	return loc
 }
 
 // latestCell is ✅ when the version is the latest, otherwise ❌ and the latest version.
