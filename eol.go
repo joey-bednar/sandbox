@@ -439,8 +439,7 @@ func errResult(svc Service, source string, err error) Result {
 // report writes a Markdown table of results to path and returns the exit code.
 func report(results []Result, path string) int {
 	var b strings.Builder
-	b.WriteString("# End of life report\n\n")
-	fmt.Fprintf(&b, "Generated %s\n\n", time.Now().In(pacific()).Format("01/02/2006 15:04 MST"))
+	fmt.Fprintf(&b, "Generated %s\n\n", time.Now().In(pacific()).Format("01/02/2006 15:04"))
 	b.WriteString("| Service | Current version | Is latest | Is supported |\n")
 	b.WriteString("|---|---|---|---|\n")
 
@@ -461,7 +460,7 @@ func report(results []Result, path string) int {
 	b.WriteString("- **Is supported:** ✅ supported; ❌ end of life; ❔ unknown (no support data available for this source); ⚠️ could not be checked (see Errors)\n")
 
 	if len(errLines) > 0 {
-		b.WriteString("\n## Errors\n\n")
+		b.WriteString("\n**Errors**\n\n")
 		b.WriteString(strings.Join(errLines, "\n"))
 		b.WriteString("\n")
 	}
