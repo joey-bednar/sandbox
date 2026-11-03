@@ -159,12 +159,13 @@ func (f *flexString) UnmarshalJSON(b []byte) error {
 }
 
 // Cycle is one release cycle as returned by endoflife.date.
-// The "eol" field is either a boolean or a "YYYY-MM-DD" date string,
-// so it's decoded into `any` and interpreted later.
+// The "eol" and "extendedSupport" fields are each either a boolean or a
+// "YYYY-MM-DD" date string, so they're decoded into `any` and interpreted later.
 type Cycle struct {
 	Cycle             flexString `json:"cycle"`
 	ReleaseDate       flexString `json:"releaseDate"`
 	EOL               any        `json:"eol"`
+	ExtendedSupport   any        `json:"extendedSupport"`
 	Latest            flexString `json:"latest"`
 	LatestReleaseDate flexString `json:"latestReleaseDate"`
 }
@@ -382,6 +383,10 @@ func checkEOL(svc Service, cycles []Cycle) Result {
 	}
 	if isEOL {
 		r.Status = StatusUnsupported
+	} else if eolDate.IsZero() {
+		// Some products (Kafka, for one) keep a supported cycle at "eol": false
+		// and publish only an extended support end date, so use that instead.
+		r.EOLDate = upcomingDate(c.ExtendedSupport)
 	}
 	return r
 }
@@ -491,7 +496,7 @@ func renderReport(results []Result) (md string, counts map[string]int) {
 
 	b.WriteString("\n**Legend**\n\n")
 	b.WriteString("- **Is latest:** ✅ running the latest version; ❌ a newer version exists (shown)\n")
-	b.WriteString("- **Is supported:** ✅ supported, meaning it still receives security fixes (with the end of support date, if known); ❌ end of life, no more security fixes (with the date it ended, if known); ❔ unknown (no support data available for this source); ⚠️ could not be checked (see Errors)\n")
+	b.WriteString("- **Is supported:** ✅ supported, meaning it still receives security fixes (with the end of support date, if known; for products with no fixed end-of-life date, such as Kafka, this is the extended end of support date); ❌ end of life, no more security fixes (with the date it ended, if known); ❔ unknown (no support data available for this source); ⚠️ could not be checked (see Errors)\n")
 
 	if len(errLines) > 0 {
 		b.WriteString("\n**Errors**\n\n")
@@ -632,6 +637,20 @@ func eolStatus(v any) (isEOL bool, date time.Time, err error) {
 	default:
 		return false, time.Time{}, fmt.Errorf("unexpected eol value type %T", v)
 	}
+}
+
+// upcomingDate returns v as a date if it is a "YYYY-MM-DD" string that hasn't
+// passed yet, otherwise the zero time.
+func upcomingDate(v any) time.Time {
+	str, ok := v.(string)
+	if !ok {
+		return time.Time{}
+	}
+	t, err := time.Parse("2006-01-02", str)
+	if err != nil || time.Now().After(t) {
+		return time.Time{}
+	}
+	return t
 }
 
 // ---- GitHub releases ----

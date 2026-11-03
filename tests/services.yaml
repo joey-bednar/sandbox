@@ -13,3 +13,5 @@ services:
   - name: minio
     version: "RELEASE.2025-03-12T18-04-18Z"
     minio: true
+  - name: kafka
+    version: "3.9.0"
