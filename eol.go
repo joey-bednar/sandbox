@@ -75,7 +75,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -86,18 +86,21 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const defaultReportPath = "report.md"
+const (
+	defaultReportPath = "report.md"
 
-const eolAPIBase = "https://endoflife.date/api/"
+	eolAPIBase = "https://endoflife.date/api/"
 
-// minioNotesURL is the directory listing the https://dl.minio.io/releases page
-// reads (client-side) to build its list. It holds one release-notes file per
-// stable release; edge builds live under a separate /edge/ path.
-const minioNotesURL = "https://dl.minio.io/aistor/minio/release/notes/"
+	// minioNotesURL is the directory listing the https://dl.minio.io/releases
+	// page reads (client-side) to build its list. It holds one release-notes
+	// file per stable release; edge builds live under a separate /edge/ path.
+	minioNotesURL = "https://dl.minio.io/aistor/minio/release/notes/"
 
-// maxConcurrentRequests caps simultaneous HTTP requests across all goroutines,
-// which keeps large service lists from tripping GitHub's secondary rate limits.
-const maxConcurrentRequests = 8
+	// maxConcurrentRequests caps simultaneous HTTP requests across all
+	// goroutines, which keeps large service lists from tripping GitHub's
+	// secondary rate limits.
+	maxConcurrentRequests = 8
+)
 
 const (
 	StatusSupported   = "SUPPORTED"
@@ -121,12 +124,11 @@ type Config struct {
 
 // Service is one entry in the YAML file.
 type Service struct {
-	Name    string `yaml:"name"`
-	Version string `yaml:"version"`
-	// VersionFrom reads the version from a variable in an env file instead.
-	VersionFrom *VersionFrom `yaml:"version_from"`
-	GitHub      string       `yaml:"github"` // optional fallback, e.g. https://github.com/owner/repo
-	MinIO       bool         `yaml:"minio"`  // scrape stable releases from dl.minio.io instead of endoflife.date
+	Name        string       `yaml:"name"`
+	Version     string       `yaml:"version"`
+	VersionFrom *VersionFrom `yaml:"version_from"` // read the version from an env file instead
+	GitHub      string       `yaml:"github"`       // optional fallback, e.g. https://github.com/owner/repo
+	MinIO       bool         `yaml:"minio"`        // scrape stable releases from dl.minio.io instead of endoflife.date
 }
 
 // VersionFrom points at a variable in an env file.
@@ -141,19 +143,18 @@ type flexString string
 
 func (f *flexString) UnmarshalJSON(b []byte) error {
 	b = bytes.TrimSpace(b)
-	if bytes.Equal(b, []byte("null")) || bytes.Equal(b, []byte("false")) || bytes.Equal(b, []byte("true")) {
+	switch {
+	case bytes.Equal(b, []byte("null")), bytes.Equal(b, []byte("false")), bytes.Equal(b, []byte("true")):
 		*f = ""
-		return nil
-	}
-	if len(b) > 0 && b[0] == '"' {
+	case len(b) > 0 && b[0] == '"':
 		var s string
 		if err := json.Unmarshal(b, &s); err != nil {
 			return err
 		}
 		*f = flexString(s)
-		return nil
+	default:
+		*f = flexString(b) // number: keep literal text
 	}
-	*f = flexString(b) // number: keep literal text
 	return nil
 }
 
@@ -226,15 +227,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(2)
 	}
-	services := cfg.Services
 
 	c := newChecker()
 
 	// One goroutine per service. Each writes only to its own slot in results,
 	// so no locking is needed and the output keeps the YAML file's order.
-	results := make([]Result, len(services))
+	results := make([]Result, len(cfg.Services))
 	var wg sync.WaitGroup
-	for i, svc := range services {
+	for i, svc := range cfg.Services {
 		wg.Go(func() { results[i] = c.check(svc) })
 	}
 	wg.Wait()
@@ -315,18 +315,27 @@ func parseEnv(content string) map[string]string {
 		if !ok {
 			continue
 		}
-		key, val = strings.TrimSpace(key), strings.TrimSpace(val)
-		if q := val[:min(1, len(val))]; (q == `"` || q == "'") && strings.Contains(val[1:], q) {
-			val = val[1 : 1+strings.Index(val[1:], q)] // quoted: ignore anything after the closing quote
-		} else if i := strings.Index(val, " #"); i >= 0 {
-			val = strings.TrimSpace(val[:i]) // inline comment on an unquoted value
-		}
-		vars[key] = val
+		vars[strings.TrimSpace(key)] = envValue(strings.TrimSpace(val))
 	}
 	return vars
 }
 
-// check looks up one service: endoflife.date first, GitHub releases as a fallback.
+// envValue strips quotes from a value, ignoring anything after the closing
+// quote. An unquoted value loses any trailing " # comment".
+func envValue(val string) string {
+	if val != "" && (val[0] == '"' || val[0] == '\'') {
+		if end := strings.IndexByte(val[1:], val[0]); end >= 0 {
+			return val[1 : 1+end]
+		}
+	}
+	if i := strings.Index(val, " #"); i >= 0 {
+		return strings.TrimSpace(val[:i])
+	}
+	return val
+}
+
+// check looks up one service: MinIO if requested, otherwise endoflife.date
+// first with GitHub releases as a fallback.
 func (c *checker) check(svc Service) Result {
 	svc.Name = strings.ToLower(strings.TrimSpace(svc.Name))
 	svc.Version = strings.TrimPrefix(strings.TrimSpace(svc.Version), "v")
@@ -436,36 +445,12 @@ func errResult(svc Service, source string, err error) Result {
 	return Result{Service: svc, Source: source, Status: StatusError, Err: err}
 }
 
-// report writes a Markdown table of results to path and returns the exit code.
+// report writes the Markdown report to path, prints a one-line summary, and
+// returns the exit code.
 func report(results []Result, path string) int {
-	var b strings.Builder
-	fmt.Fprintf(&b, "Generated %s\n\n", time.Now().In(pacific()).Format("01/02/2006 15:04"))
-	b.WriteString("| Service | Current version | Is latest | Is supported |\n")
-	b.WriteString("|---|---|---|---|\n")
+	md, counts := renderReport(results)
 
-	counts := map[string]int{}
-	var errLines []string
-
-	for _, r := range results {
-		counts[r.Status]++
-		if r.Err != nil {
-			errLines = append(errLines, fmt.Sprintf("- **%s %s**: %v", mdEscape(r.Service.Name), mdEscape(r.Service.Version), mdEscape(r.Err.Error())))
-		}
-		fmt.Fprintf(&b, "| %s | %s | %s | %s |\n",
-			mdEscape(r.Service.Name), mdEscape(r.Service.Version), latestCell(r), supportedCell(r))
-	}
-
-	b.WriteString("\n**Legend**\n\n")
-	b.WriteString("- **Is latest:** ✅ running the latest version; ❌ a newer version exists (shown)\n")
-	b.WriteString("- **Is supported:** ✅ supported; ❌ end of life; ❔ unknown (no support data available for this source); ⚠️ could not be checked (see Errors)\n")
-
-	if len(errLines) > 0 {
-		b.WriteString("\n**Errors**\n\n")
-		b.WriteString(strings.Join(errLines, "\n"))
-		b.WriteString("\n")
-	}
-
-	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(md), 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "error: writing %s: %v\n", path, err)
 		return 2
 	}
@@ -481,6 +466,37 @@ func report(results []Result, path string) int {
 	default:
 		return 0
 	}
+}
+
+// renderReport builds the Markdown report and counts results by status.
+func renderReport(results []Result) (md string, counts map[string]int) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Generated %s\n\n", time.Now().In(pacific()).Format("01/02/2006 15:04"))
+	b.WriteString("| Service | Current version | Is latest | Is supported |\n")
+	b.WriteString("|---|---|---|---|\n")
+
+	counts = map[string]int{}
+	var errLines []string
+
+	for _, r := range results {
+		counts[r.Status]++
+		name, version := mdEscape(r.Service.Name), mdEscape(r.Service.Version)
+		if r.Err != nil {
+			errLines = append(errLines, fmt.Sprintf("- **%s %s**: %s", name, version, mdEscape(r.Err.Error())))
+		}
+		fmt.Fprintf(&b, "| %s | %s | %s | %s |\n", name, version, latestCell(r), supportedCell(r))
+	}
+
+	b.WriteString("\n**Legend**\n\n")
+	b.WriteString("- **Is latest:** ✅ running the latest version; ❌ a newer version exists (shown)\n")
+	b.WriteString("- **Is supported:** ✅ supported; ❌ end of life; ❔ unknown (no support data available for this source); ⚠️ could not be checked (see Errors)\n")
+
+	if len(errLines) > 0 {
+		b.WriteString("\n**Errors**\n\n")
+		b.WriteString(strings.Join(errLines, "\n"))
+		b.WriteString("\n")
+	}
+	return b.String(), counts
 }
 
 // pacific returns the US Pacific time zone (PST in winter, PDT in summer).
@@ -504,6 +520,7 @@ func latestCell(r Result) string {
 	}
 }
 
+// supportedCell maps a result status to its emoji.
 func supportedCell(r Result) string {
 	switch r.Status {
 	case StatusSupported:
@@ -523,6 +540,7 @@ func mdEscape(s string) string {
 	return strings.ReplaceAll(s, "\n", " ")
 }
 
+// dash returns "-" for an empty string.
 func dash(s string) string {
 	if s == "" {
 		return "-"
@@ -532,6 +550,7 @@ func dash(s string) string {
 
 // ---- endoflife.date ----
 
+// cycles fetches the release cycles for an endoflife.date product.
 func (c *checker) cycles(product string) ([]Cycle, error) {
 	return limit(c, func() ([]Cycle, error) { return fetchCycles(c.client, product) })
 }
@@ -577,6 +596,7 @@ func findCycle(cycles []Cycle, version string) *Cycle {
 	return best
 }
 
+// listCycles joins the cycle names for use in error messages.
 func listCycles(cycles []Cycle) string {
 	names := make([]string, 0, len(cycles))
 	for _, c := range cycles {
@@ -798,6 +818,7 @@ func fetchMinIOReleases(client *http.Client) ([]string, error) {
 	if len(versions) == 0 {
 		return nil, errors.New("no stable releases found on dl.minio.io (page layout may have changed)")
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(versions)))
+	slices.Sort(versions)
+	slices.Reverse(versions)
 	return versions, nil
 }
