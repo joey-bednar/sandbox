@@ -1,0 +1,10 @@
+services:
+  - name: keycloak
+    version: "26.0.5"
+  - name: python
+    version: "3.10.4"
+  - name: postgresql
+    version: "16.2"
+  - name: trivy
+    version: "0.56.0"
+    github: https://github.com/aquasecurity/trivy
