@@ -80,6 +80,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	_ "time/tzdata" // embed zone data so America/Los_Angeles loads on any system
 
@@ -475,8 +477,14 @@ func report(results []Result, path string) int {
 	}
 }
 
-// renderReport builds the Markdown report and counts results by status.
+// renderReport builds the Markdown report, with rows sorted by service name,
+// and counts results by status.
 func renderReport(results []Result) (md string, counts map[string]int) {
+	results = slices.Clone(results)
+	slices.SortStableFunc(results, func(a, b Result) int {
+		return strings.Compare(strings.ToLower(a.Service.Name), strings.ToLower(b.Service.Name))
+	})
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "Generated %s\n\n", time.Now().In(pacific()).Format("01/02/2006 15:04"))
 	b.WriteString("| Service | Current version | Is latest | Is supported |\n")
@@ -487,7 +495,7 @@ func renderReport(results []Result) (md string, counts map[string]int) {
 
 	for _, r := range results {
 		counts[r.Status]++
-		name, version := mdEscape(r.Service.Name), mdEscape(r.Service.Version)
+		name, version := mdEscape(capitalize(r.Service.Name)), mdEscape(r.Service.Version)
 		if r.Err != nil {
 			errLines = append(errLines, fmt.Sprintf("- **%s %s**: %s", name, version, mdEscape(r.Err.Error())))
 		}
@@ -547,6 +555,12 @@ func supportedCell(r Result) string {
 	default:
 		return "⚠️"
 	}
+}
+
+// capitalize upper-cases the first letter of s.
+func capitalize(s string) string {
+	r, size := utf8.DecodeRuneInString(s)
+	return string(unicode.ToUpper(r)) + s[size:]
 }
 
 // mdEscape keeps text from breaking out of a Markdown table cell.
