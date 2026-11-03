@@ -183,6 +183,7 @@ type Result struct {
 	Latest  string
 	Newer   bool // a newer version than Service.Version exists
 	Status  string
+	EOLDate time.Time // end of support date; zero if unknown or not a date
 	Err     error
 }
 
@@ -366,7 +367,7 @@ func checkEOL(svc Service, cycles []Cycle) Result {
 			fmt.Errorf("no release cycle matches %s (known: %s)", svc.Version, listCycles(cycles)))
 	}
 
-	isEOL, err := eolStatus(c.EOL)
+	isEOL, eolDate, err := eolStatus(c.EOL)
 	if err != nil {
 		return errResult(svc, SourceEOL, err)
 	}
@@ -377,6 +378,7 @@ func checkEOL(svc Service, cycles []Cycle) Result {
 		Latest:  string(c.Latest),
 		Newer:   isNewer(string(c.Latest), svc.Version),
 		Status:  StatusSupported,
+		EOLDate: eolDate,
 	}
 	if isEOL {
 		r.Status = StatusUnsupported
@@ -489,7 +491,7 @@ func renderReport(results []Result) (md string, counts map[string]int) {
 
 	b.WriteString("\n**Legend**\n\n")
 	b.WriteString("- **Is latest:** ✅ running the latest version; ❌ a newer version exists (shown)\n")
-	b.WriteString("- **Is supported:** ✅ supported; ❌ end of life; ❔ unknown (no support data available for this source); ⚠️ could not be checked (see Errors)\n")
+	b.WriteString("- **Is supported:** ✅ supported, meaning it still receives security fixes (with the end of support date, if known); ❌ end of life, no more security fixes (with the date it ended, if known); ❔ unknown (no support data available for this source); ⚠️ could not be checked (see Errors)\n")
 
 	if len(errLines) > 0 {
 		b.WriteString("\n**Errors**\n\n")
@@ -520,13 +522,21 @@ func latestCell(r Result) string {
 	}
 }
 
-// supportedCell maps a result status to its emoji.
+// supportedCell maps a result status to its emoji, followed by the end of
+// support date when one is known.
 func supportedCell(r Result) string {
+	date := r.EOLDate.Format("01/02/2006")
 	switch r.Status {
 	case StatusSupported:
-		return "✅"
+		if r.EOLDate.IsZero() {
+			return "✅"
+		}
+		return "✅ until " + date
 	case StatusUnsupported:
-		return "❌"
+		if r.EOLDate.IsZero() {
+			return "❌"
+		}
+		return "❌ as of " + date
 	case StatusUnknown:
 		return "❔"
 	default:
@@ -606,20 +616,21 @@ func listCycles(cycles []Cycle) string {
 }
 
 // eolStatus interprets the API's "eol" field, which may be a bool or a date.
-func eolStatus(v any) (isEOL bool, err error) {
+// The date is only set when the field is a date.
+func eolStatus(v any) (isEOL bool, date time.Time, err error) {
 	switch val := v.(type) {
 	case bool:
-		return val, nil
+		return val, time.Time{}, nil
 	case string:
 		t, err := time.Parse("2006-01-02", val)
 		if err != nil {
-			return false, fmt.Errorf("unparseable eol date %q: %w", val, err)
+			return false, time.Time{}, fmt.Errorf("unparseable eol date %q: %w", val, err)
 		}
-		return !time.Now().Before(t), nil
+		return !time.Now().Before(t), t, nil
 	case nil:
-		return false, nil
+		return false, time.Time{}, nil
 	default:
-		return false, fmt.Errorf("unexpected eol value type %T", v)
+		return false, time.Time{}, fmt.Errorf("unexpected eol value type %T", v)
 	}
 }
 
