@@ -83,8 +83,6 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	_ "time/tzdata" // embed zone data so America/Los_Angeles loads on any system
-
 	"gopkg.in/yaml.v3"
 )
 
@@ -486,7 +484,6 @@ func renderReport(results []Result) (md string, counts map[string]int) {
 	})
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "Generated %s\n\n", time.Now().In(pacific()).Format("01/02/2006 15:04"))
 	b.WriteString("| Service | Current version | Is latest | Is supported |\n")
 	b.WriteString("|---|---|---|---|\n")
 
@@ -503,8 +500,10 @@ func renderReport(results []Result) (md string, counts map[string]int) {
 	}
 
 	b.WriteString("\n**Legend**\n\n")
-	b.WriteString("- **Is latest:** ✅ running the latest version; ❌ a newer version exists (shown)\n")
-	b.WriteString("- **Is supported:** ✅ supported, meaning it still receives security fixes (with the end of support date, if known; for products with no fixed end-of-life date, such as Kafka, this is the extended end of support date); ❌ end of life, no more security fixes (with the date it ended, if known); ❔ unknown (no support data available for this source); ⚠️ could not be checked (see Errors)\n")
+	b.WriteString("- ✅ Yes\n")
+	b.WriteString("- ❌ No (newer version available, or end of life)\n")
+	b.WriteString("- ❔ Unknown\n")
+	b.WriteString("- ⚠️ Could not be checked\n")
 
 	if len(errLines) > 0 {
 		b.WriteString("\n**Errors**\n\n")
@@ -512,15 +511,6 @@ func renderReport(results []Result) (md string, counts map[string]int) {
 		b.WriteString("\n")
 	}
 	return b.String(), counts
-}
-
-// pacific returns the US Pacific time zone (PST in winter, PDT in summer).
-func pacific() *time.Location {
-	loc, err := time.LoadLocation("America/Los_Angeles")
-	if err != nil {
-		return time.FixedZone("PST", -8*60*60)
-	}
-	return loc
 }
 
 // latestCell is ✅ when the version is the latest, otherwise ❌ and the latest version.
