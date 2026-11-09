@@ -23,18 +23,17 @@
 //	    version: "0.56.0"
 //	    github: https://github.com/aquasecurity/trivy
 //
-// Instead of a literal "version", a service can read it from a variable in an
-// env file (KEY=value lines, as in a .env file):
+// Instead of a literal "version", a service can read it from an env file
+// (KEY=value lines, as in a .env file):
 //
 //	services:
 //	  - name: keycloak
-//	    version_from:
-//	      file: release.env
-//	      var: UPSTREAM_VERSION
+//	    env_file: release.env
 //
-// The file path is relative to the YAML file. Set exactly one of "version" and
-// "version_from". Supported env syntax: blank lines, # comments, an optional
-// "export " prefix, and single- or double-quoted values.
+// The version is read from the UPSTREAM_VERSION variable. The file path is
+// relative to the YAML file. Set exactly one of "version" and "env_file".
+// Supported env syntax: blank lines, # comments, an optional "export " prefix,
+// and single- or double-quoted values.
 //
 // "name" should be an endoflife.date product slug
 // (https://endoflife.date/api/all.json). "github" is optional and is only used
@@ -127,17 +126,11 @@ type Config struct {
 
 // Service is one entry in the YAML file.
 type Service struct {
-	Name        string       `yaml:"name"`
-	Version     string       `yaml:"version"`
-	VersionFrom *VersionFrom `yaml:"version_from"` // read the version from an env file instead
-	GitHub      string       `yaml:"github"`       // optional fallback, e.g. https://github.com/owner/repo
-	MinIO       bool         `yaml:"minio"`        // scrape stable releases from dl.minio.io instead of endoflife.date
-}
-
-// VersionFrom points at a variable in an env file.
-type VersionFrom struct {
-	File string `yaml:"file"`
-	Var  string `yaml:"var"`
+	Name    string `yaml:"name"`
+	Version string `yaml:"version"`
+	EnvFile string `yaml:"env_file"` // read UPSTREAM_VERSION from this env file instead
+	GitHub  string `yaml:"github"`   // optional fallback, e.g. https://github.com/owner/repo
+	MinIO   bool   `yaml:"minio"`    // scrape stable releases from dl.minio.io instead of endoflife.date
 }
 
 // flexString accepts a JSON string or number and keeps its literal text,
@@ -269,27 +262,27 @@ func loadConfig(path string) (*Config, error) {
 			return nil, fmt.Errorf("%s: service #%d needs a 'name'", path, i+1)
 		}
 		switch {
-		case hasVersion && s.VersionFrom != nil:
-			return nil, fmt.Errorf("%s: service #%d (%s) sets both 'version' and 'version_from'", path, i+1, s.Name)
-		case s.VersionFrom != nil:
-			v, err := versionFromEnv(baseDir, *s.VersionFrom)
+		case hasVersion && s.EnvFile != "":
+			return nil, fmt.Errorf("%s: service #%d (%s) sets both 'version' and 'env_file'", path, i+1, s.Name)
+		case s.EnvFile != "":
+			v, err := versionFromEnv(baseDir, s.EnvFile)
 			if err != nil {
 				return nil, fmt.Errorf("%s: service #%d (%s): %w", path, i+1, s.Name, err)
 			}
 			s.Version = v
 		case !hasVersion:
-			return nil, fmt.Errorf("%s: service #%d (%s) needs a 'version' or 'version_from'", path, i+1, s.Name)
+			return nil, fmt.Errorf("%s: service #%d (%s) needs a 'version' or 'env_file'", path, i+1, s.Name)
 		}
 	}
 	return &cfg, nil
 }
 
-// versionFromEnv reads vf.Var from the env file vf.File, resolved against baseDir.
-func versionFromEnv(baseDir string, vf VersionFrom) (string, error) {
-	if vf.File == "" || vf.Var == "" {
-		return "", errors.New("'version_from' needs both 'file' and 'var'")
-	}
-	path := vf.File
+// envVersionVar is the variable read from a service's env_file.
+const envVersionVar = "UPSTREAM_VERSION"
+
+// versionFromEnv reads UPSTREAM_VERSION from the env file, resolved against baseDir.
+func versionFromEnv(baseDir, file string) (string, error) {
+	path := file
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(baseDir, path)
 	}
@@ -297,12 +290,12 @@ func versionFromEnv(baseDir string, vf VersionFrom) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("reading env file: %w", err)
 	}
-	val, ok := parseEnv(string(data))[vf.Var]
+	val, ok := parseEnv(string(data))[envVersionVar]
 	if !ok {
-		return "", fmt.Errorf("variable %s not found in %s", vf.Var, path)
+		return "", fmt.Errorf("variable %s not found in %s", envVersionVar, path)
 	}
 	if strings.TrimSpace(val) == "" {
-		return "", fmt.Errorf("variable %s in %s is empty", vf.Var, path)
+		return "", fmt.Errorf("variable %s in %s is empty", envVersionVar, path)
 	}
 	return val, nil
 }
