@@ -59,9 +59,9 @@
 //	    version: "RELEASE.2025-03-12T18-04-18Z"
 //	    minio: true
 //
-// Exit codes: 0 = nothing end of life, 1 = at least one end of life,
-// 2 = at least one error (unknown product with no fallback, network failure).
-// UNKNOWN results don't change the exit code. Errors take precedence over EOL.
+// Exit codes: 0 = the report was written, 1 = it couldn't be (bad usage or
+// config, or a write failure). Support status and per-service check errors
+// don't affect the exit code.
 package main
 
 import (
@@ -69,6 +69,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -94,6 +95,8 @@ const (
 	// minioNotesURL is the directory listing the https://dl.minio.io/releases
 	// page reads (client-side) to build its list. It holds one release-notes
 	// file per stable release; edge builds live under a separate /edge/ path.
+	minioReleasesURL = "https://dl.minio.io/releases"
+
 	minioNotesURL = "https://dl.minio.io/aistor/minio/release/notes/"
 
 	// maxConcurrentRequests caps simultaneous HTTP requests across all
@@ -217,7 +220,7 @@ func limit[T any](c *checker, fn func() (T, error)) (T, error) {
 func main() {
 	if len(os.Args) < 2 || len(os.Args) > 3 {
 		fmt.Fprintf(os.Stderr, "usage: %s <services.yaml> [report.md]\n", os.Args[0])
-		os.Exit(2)
+		os.Exit(1)
 	}
 	outPath := defaultReportPath
 	if len(os.Args) == 3 {
@@ -227,7 +230,7 @@ func main() {
 	cfg, err := loadConfig(os.Args[1])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(2)
+		os.Exit(1)
 	}
 
 	c := newChecker()
@@ -459,20 +462,13 @@ func report(results []Result, path string) int {
 
 	if err := os.WriteFile(path, []byte(md), 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "error: writing %s: %v\n", path, err)
-		return 2
+		return 1
 	}
 	fmt.Printf("Wrote %s (%d checked: %d supported, %d unsupported, %d unknown, %d errors)\n",
 		path, len(results), counts[StatusSupported], counts[StatusUnsupported],
 		counts[StatusUnknown], counts[StatusError])
 
-	switch {
-	case counts[StatusError] > 0:
-		return 2
-	case counts[StatusUnsupported] > 0:
-		return 1
-	default:
-		return 0
-	}
+	return 0
 }
 
 // renderReport builds the Markdown report, with rows sorted by service name,
@@ -519,9 +515,9 @@ func latestCell(r Result) string {
 	case r.Status == StatusError:
 		return "-"
 	case r.Newer:
-		return "❌ " + mdEscape(dash(r.Latest))
+		return link(r, "❌") + " " + mdEscape(dash(r.Latest))
 	default:
-		return "✅"
+		return link(r, "✅")
 	}
 }
 
@@ -529,14 +525,61 @@ func latestCell(r Result) string {
 func supportedCell(r Result) string {
 	switch r.Status {
 	case StatusSupported:
-		return "✅"
+		return link(r, "✅")
 	case StatusUnsupported:
-		return "❌"
+		return link(r, "❌")
 	case StatusUnknown:
 		return "❔"
 	default:
 		return "⚠️"
 	}
+}
+
+// link wraps an emoji in an unstyled link to the page the result came from:
+// the endoflife.date product page, or the GitHub repo when that was the
+// source. Without a page to point at, the emoji is returned as is.
+func link(r Result, emoji string) string {
+	u := sourceURL(r)
+	if u == "" {
+		return emoji
+	}
+	return fmt.Sprintf(`<a href="%s" style="color:inherit;text-decoration:none">%s</a>`,
+		html.EscapeString(u), emoji)
+}
+
+// sourceURL is the web page backing a result, or "" if there is none.
+func sourceURL(r Result) string {
+	switch {
+	case r.Source == SourceEOL:
+		return "https://endoflife.date/" + url.PathEscape(r.Service.Name)
+	case r.Source == SourceMinIO:
+		return minioReleasesURL
+	case r.Service.GitHub != "":
+		return githubWebURL(r.Service.GitHub)
+	}
+	return ""
+}
+
+// githubWebURL turns a github reference (see githubReleasesURL) into the
+// repo's web page, or "" if it can't be parsed.
+func githubWebURL(ref string) string {
+	raw := strings.TrimSuffix(strings.TrimSpace(ref), "/")
+	if !strings.Contains(raw, "://") {
+		if strings.Count(raw, "/") == 1 {
+			raw = "https://github.com/" + raw
+		} else {
+			raw = "https://" + raw
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host + "/" + parts[0] + "/" + strings.TrimSuffix(parts[1], ".git")
 }
 
 // capitalize upper-cases the first letter of s.
