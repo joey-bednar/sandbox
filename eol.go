@@ -525,21 +525,13 @@ func latestCell(r Result) string {
 	}
 }
 
-// supportedCell maps a result status to its emoji, followed by the end of
-// support date when one is known.
+// supportedCell maps a result status to its emoji.
 func supportedCell(r Result) string {
-	date := r.EOLDate.Format("01/02/2006")
 	switch r.Status {
 	case StatusSupported:
-		if r.EOLDate.IsZero() {
-			return "✅"
-		}
-		return "✅ until " + date
+		return "✅"
 	case StatusUnsupported:
-		if r.EOLDate.IsZero() {
-			return "❌"
-		}
-		return "❌ as of " + date
+		return "❌"
 	case StatusUnknown:
 		return "❔"
 	default:
