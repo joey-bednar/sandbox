@@ -69,7 +69,7 @@ func newRootCmd() *cobra.Command {
 	o := defaultOptions()
 	cmd := &cobra.Command{
 		Use:   "babysit",
-		Short: "Commit and push (staged changes, or a junk change if nothing is staged), then babysit the GitLab pipelines",
+		Short: "Automates the process of getting passing pipelines for your changes.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cmd.SilenceUsage = true
@@ -77,7 +77,7 @@ func newRootCmd() *cobra.Command {
 		},
 	}
 	f := cmd.Flags()
-	f.BoolVar(&o.upgrade, "upgrade", false, `in helm-charts, play the manual "Setup" job whose name contains "upgrade"`)
+	f.BoolVar(&o.upgrade, "upgrade", false, "run the helm-charts upgrade")
 	f.StringVar(&o.host, "debug-host", "", "GitLab host or base URL instead of the one from the remote")
 	f.StringVar(&o.project, "debug-project", "", "GitLab project path instead of the one from the remote")
 	f.DurationVar(&o.pollInterval, "debug-poll-interval", o.pollInterval, "how often to poll GitLab")
