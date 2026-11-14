@@ -27,7 +27,12 @@ type options struct {
 	timeout      time.Duration
 	pollInterval time.Duration
 	grace        time.Duration
+	stages       []string
+	allStages    bool
 }
+
+// defaultStages are the stages whose jobs babysit cares about triggering/rerunning.
+var defaultStages = []string{"Monorepo Triggers", "Deploy and Test"}
 
 // Execute runs the root command.
 func Execute() {
@@ -55,6 +60,8 @@ func newRootCmd() *cobra.Command {
 	f.DurationVar(&o.timeout, "timeout", 3*time.Minute, "how long to wait for GitLab to create the pipeline")
 	f.DurationVar(&o.pollInterval, "poll-interval", 5*time.Second, "how often to poll for the pipeline")
 	f.DurationVar(&o.grace, "grace", 10*time.Second, "extra wait after the first pipeline appears, to catch sibling pipelines")
+	f.StringSliceVar(&o.stages, "stages", defaultStages, "only show these top-level stages (case-insensitive; spaces, '-' and '_' are equivalent)")
+	f.BoolVar(&o.allStages, "all-stages", false, "show every stage, ignoring --stages")
 	_ = cmd.MarkFlagRequired("message")
 	return cmd
 }
@@ -123,10 +130,27 @@ func run(ctx context.Context, o options) error {
 		if err != nil {
 			return err
 		}
+		if !o.allStages {
+			var missing []string
+			all := structure
+			structure, missing = gitlab.FilterStages(all, o.stages)
+			if len(missing) > 0 {
+				fmt.Fprintf(os.Stderr, "\nwarning: pipeline #%s has no stage(s) %q; available: %q\n",
+					all.IID, missing, stageNames(all))
+			}
+		}
 		fmt.Println()
 		render.Tree(os.Stdout, structure, color)
 	}
 	return nil
+}
+
+func stageNames(p *gitlab.Pipeline) []string {
+	names := make([]string, len(p.Stages))
+	for i, s := range p.Stages {
+		names[i] = s.Name
+	}
+	return names
 }
 
 func resolveProject(repo *git.Repo, o options) (host, project string, err error) {

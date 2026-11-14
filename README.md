@@ -29,6 +29,8 @@ Host and project are derived from the `origin` remote. Override as needed:
 | `--project` | from remote | Project path, e.g. `group/sub/project` |
 | `--timeout` | `3m` | How long to wait for GitLab to create a pipeline |
 | `--poll-interval` | `5s` | Polling interval while waiting |
+| `--stages` | `Monorepo Triggers,Deploy and Test` | Only show these top-level stages (case-insensitive; spaces, `-`, `_` equivalent) |
+| `--all-stages` | `false` | Show every stage |
 | `--grace` | `10s` | Extra wait after the first pipeline appears, to catch sibling pipelines (e.g. push + merge request) |
 
 Example output:
