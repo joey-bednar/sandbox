@@ -4,19 +4,20 @@ A CLI for babysitting flaky GitLab CI pipelines.
 
 Current scope: commit and push the staged changes, find the GitLab pipeline(s) created for that commit, and print their structure. The output shows stages, jobs, manual jobs, and child/downstream pipelines nested under their trigger jobs.
 
-## Install
-
-```sh
-go install ./cmd/babysit
-```
-
 ## Usage
+
+Run it from the repo you want to babysit, pointing `go run -C` at this checkout:
 
 ```sh
 export GITLAB_API_KEY=glpat-...   # needs read_api (api for future retry features)
+cd ~/work/your-gitlab-repo
 git add -p
-babysit -m "Fix the thing"
+go run -C ~/sandbox . -m "Fix the thing"
 ```
+
+`-C` makes Go build from this checkout, and babysit runs git in the directory you
+invoked it from (via `$PWD`). Plain `go run ~/sandbox` cannot work from another
+repo, because Go resolves the module from the current directory.
 
 Host and project are derived from the `origin` remote. Override as needed:
 

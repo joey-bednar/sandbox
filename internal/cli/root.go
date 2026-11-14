@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -67,7 +68,7 @@ func run(ctx context.Context, o options) error {
 		return errors.New("commit message must not be empty")
 	}
 
-	repo := &git.Repo{Stdout: os.Stdout, Stderr: os.Stderr}
+	repo := &git.Repo{Dir: callerDir(), Stdout: os.Stdout, Stderr: os.Stderr}
 	if err := repo.EnsureRepo(); err != nil {
 		return err
 	}
@@ -148,6 +149,18 @@ func resolveProject(repo *git.Repo, o options) (host, project string, err error)
 		project = rProject
 	}
 	return host, project, nil
+}
+
+// callerDir returns the directory babysit was invoked from. `go run -C <dir>`
+// changes the working directory to the babysit source tree but leaves the
+// shell's $PWD untouched, so prefer $PWD when it points at a real directory.
+func callerDir() string {
+	if pwd := os.Getenv("PWD"); filepath.IsAbs(pwd) {
+		if fi, err := os.Stat(pwd); err == nil && fi.IsDir() {
+			return pwd
+		}
+	}
+	return ""
 }
 
 func isTerminal(f *os.File) bool {
