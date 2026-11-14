@@ -272,22 +272,18 @@ func pushForNewPipeline(ctx context.Context, repo *git.Repo, client *gitlab.Clie
 	return matches[0].Pipeline, nil
 }
 
-// report prints each outcome with the links that prove it passed.
+// report prints each passing pipeline as a markdown list item, ready to
+// paste into the merge request, and each failure with its reason.
 func report(outcomes []babysit.Outcome) error {
-	fmt.Println("\nResults:")
+	fmt.Println()
 	failed := 0
 	for _, o := range outcomes {
 		if o.Err != nil {
 			failed++
-			fmt.Printf("  %-20s FAILED  %v\n", o.Spec.Name, o.Err)
+			fmt.Printf("- Failed %s: %v\n", o.Spec.Name, o.Err)
 			continue
 		}
-		fmt.Printf("  %-20s PASSED  %s\n", o.Spec.Name, o.Pipeline.WebURL)
-		fmt.Printf("  %-20s         triggered from %s", "", o.Main.WebURL)
-		if o.Pushes > 0 {
-			fmt.Printf(" (after %d new push(es))", o.Pushes)
-		}
-		fmt.Println()
+		fmt.Printf("- Passing [%s](%s)\n", o.Spec.Name, o.Pipeline.WebURL)
 	}
 	if failed > 0 {
 		return fmt.Errorf("%d of %d pipeline(s) did not pass", failed, len(outcomes))

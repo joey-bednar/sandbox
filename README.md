@@ -78,15 +78,14 @@ Each triggered pipeline goes through the same steps. On every poll:
 
 **helm-charts Deploy failures** can't be fixed by retrying. When one happens, babysit still releases Post Clean Up and waits for it, so the environment is torn down. Then it pushes a junk commit (see above; only that file is committed, so anything you've staged meanwhile is left alone), waits for the new main pipeline, and triggers helm-charts there. This repeats up to `--max-pushes` times. automated-testing is not re-triggered; it keeps going (or stays done) in the pipeline it started in.
 
-At the end babysit prints the passing pipeline for each, which may be from different commits:
+At the end babysit prints the passing pipeline for each as a markdown list, ready to paste into the merge request. They may be from different commits:
 
 ```
-Results:
-  automated-testing    PASSED  https://gitlab.example.com/g/tests/-/pipelines/301
-                               triggered from https://gitlab.example.com/g/p/-/pipelines/201
-  helm-charts          PASSED  https://gitlab.example.com/g/helm/-/pipelines/402
-                               triggered from https://gitlab.example.com/g/p/-/pipelines/202 (after 1 new push(es))
+- Passing [automated-testing](https://gitlab.example.com/g/tests/-/pipelines/301)
+- Passing [helm-charts](https://gitlab.example.com/g/helm/-/pipelines/402)
 ```
+
+A spec that didn't pass is listed as `- Failed <name>: <reason>` instead.
 
 **GitLab 5xx errors on play/retry/cancel** don't stop babysit. GitLab sometimes applies the action and still answers 500, so babysit doesn't resend blindly. It re-reads the job's status 2s later and only acts again if the action didn't take effect. Error messages include GitLab's request ID, which an admin can look up in the server logs.
 
