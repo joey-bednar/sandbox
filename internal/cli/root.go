@@ -3,7 +3,6 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -22,27 +21,38 @@ import (
 
 const tokenEnv = "GITLAB_API_KEY"
 
+// options holds babysit's settings. They are fixed; only the debug ones
+// (hidden flags, for testing against a fake GitLab) can be changed.
 type options struct {
 	message      string
 	remote       string
-	host         string
-	project      string
+	host         string // debug: GitLab host or base URL instead of the remote's
+	project      string // debug: GitLab project path instead of the remote's
 	timeout      time.Duration
-	pollInterval time.Duration
+	pollInterval time.Duration // debug: how often to poll GitLab
 	stages       []string
-	allStages    bool
 	testSuffix   string
 	maxRetries   int
 	testTimeout  time.Duration
-	base         string
 	helmJob      string
 	maxPushes    int
 }
 
-const defaultMessage = "Get passing pipelines"
-
-// defaultStages are the stages whose jobs babysit cares about triggering/rerunning.
-var defaultStages = []string{"Monorepo Triggers", "Deploy and Test"}
+func defaultOptions() options {
+	return options{
+		message:      "Get passing pipelines",
+		remote:       "origin",
+		timeout:      15 * time.Minute, // for the main pipeline's stages to appear
+		pollInterval: 10 * time.Second,
+		// Stages of the main pipeline holding the trigger jobs.
+		stages:      []string{"Monorepo Triggers", "Deploy and Test"},
+		testSuffix:  "-automated-testing",
+		maxRetries:  0, // retry forever
+		testTimeout: 20 * time.Minute,
+		helmJob:     "helm-charts",
+		maxPushes:   5,
+	}
+}
 
 // Execute runs the root command. Ctrl-C cancels the context so babysit can
 // report what it left behind (e.g. clean-up jobs it is holding).
@@ -55,9 +65,9 @@ func Execute() {
 }
 
 func newRootCmd() *cobra.Command {
-	var o options
+	o := defaultOptions()
 	cmd := &cobra.Command{
-		Use:   "babysit [-m <message>]",
+		Use:   "babysit",
 		Short: "Commit and push (staged changes, or a junk change if nothing is staged), then babysit the GitLab pipelines",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -66,20 +76,12 @@ func newRootCmd() *cobra.Command {
 		},
 	}
 	f := cmd.Flags()
-	f.StringVarP(&o.message, "message", "m", defaultMessage, "commit message")
-	f.StringVar(&o.base, "base", "", "base branch for finding files changed on this branch (default: the remote's default branch)")
-	f.StringVar(&o.remote, "remote", "origin", "git remote to push to")
-	f.StringVar(&o.host, "host", "", "GitLab host or base URL (default: derived from the remote URL, https assumed)")
-	f.StringVar(&o.project, "project", "", "GitLab project path, e.g. group/project (default: derived from the remote URL)")
-	f.DurationVar(&o.timeout, "timeout", 15*time.Minute, "how long to wait for the stages to appear")
-	f.DurationVar(&o.pollInterval, "poll-interval", 10*time.Second, "how often to poll GitLab")
-	f.StringSliceVar(&o.stages, "stages", defaultStages, "stages to look for in the pipeline and its downstream pipelines (case-insensitive; spaces, '-' and '_' are equivalent)")
-	f.BoolVar(&o.allStages, "all-stages", false, "skip the stage search and show the full pushed pipeline(s)")
-	f.StringVar(&o.testSuffix, "test-job-suffix", "-automated-testing", "trigger and babysit the job with this name suffix; empty disables")
-	f.StringVar(&o.helmJob, "helm-job", "helm-charts", "trigger and babysit the job with this exact name in \"Deploy and Test\"; empty disables")
-	f.IntVar(&o.maxPushes, "max-pushes", 5, "for helm-charts: give up after pushing this many new commits (0 = unlimited)")
-	f.DurationVar(&o.testTimeout, "test-job-timeout", 20*time.Minute, `restart automated-testing "Execute Test Cases" jobs running longer than this (0 disables)`)
-	f.IntVar(&o.maxRetries, "max-retries", 0, "give up after a job fails this many times (0 = retry forever)")
+	f.StringVar(&o.host, "debug-host", "", "GitLab host or base URL instead of the one from the remote")
+	f.StringVar(&o.project, "debug-project", "", "GitLab project path instead of the one from the remote")
+	f.DurationVar(&o.pollInterval, "debug-poll-interval", o.pollInterval, "how often to poll GitLab")
+	for _, name := range []string{"debug-host", "debug-project", "debug-poll-interval"} {
+		_ = f.MarkHidden(name)
+	}
 	return cmd
 }
 
@@ -87,9 +89,6 @@ func run(ctx context.Context, o options) error {
 	token := os.Getenv(tokenEnv)
 	if token == "" {
 		return fmt.Errorf("%s is not set", tokenEnv)
-	}
-	if o.message == "" {
-		return errors.New("commit message must not be empty")
 	}
 
 	repo := &git.Repo{Dir: callerDir()}
@@ -110,9 +109,7 @@ func run(ctx context.Context, o options) error {
 	for i, s := range specs {
 		names[i] = s.Name
 	}
-	// Full screen only when there is something to babysit; --all-stages
-	// prints a one-off tree instead.
-	d := tui.New(os.Stdout, !o.allStages && len(specs) > 0, names...)
+	d := tui.New(os.Stdout, true, names...)
 	defer d.Close()
 	gitOut := d.Writer("")
 	repo.Stdout, repo.Stderr = gitOut, gitOut
@@ -142,23 +139,6 @@ func run(ctx context.Context, o options) error {
 	defer cancel()
 	color := isTerminal(os.Stdout)
 
-	if o.allStages {
-		logf("waiting for pipeline(s) on %s/%s...", host, project)
-		pipelines, err := client.WaitForPipelines(waitCtx, project, sha, o.pollInterval)
-		if err != nil {
-			return err
-		}
-		for _, p := range pipelines {
-			structure, err := client.GetPipelineStructure(ctx, project, p.IID)
-			if err != nil {
-				return err
-			}
-			fmt.Println()
-			render.Tree(os.Stdout, structure, color)
-		}
-		return nil
-	}
-
 	matches, err := waitForMain(waitCtx, client, project, sha, o, logf)
 	if err != nil {
 		return err
@@ -170,9 +150,6 @@ func run(ctx context.Context, o options) error {
 			fmt.Println()
 			render.Tree(os.Stdout, filtered, color)
 		}
-	}
-	if len(specs) == 0 {
-		return nil
 	}
 
 	coord := &babysit.Coordinator{
@@ -216,19 +193,16 @@ func waitForMain(ctx context.Context, client *gitlab.Client, project, sha string
 
 // buildSpecs describes the triggered pipelines to babysit.
 func buildSpecs(o options) []babysit.Spec {
-	var specs []babysit.Spec
-	if o.testSuffix != "" {
-		specs = append(specs, babysit.Spec{
+	return []babysit.Spec{
+		{
 			Name:          strings.TrimPrefix(o.testSuffix, "-"),
 			TriggerStages: o.stages,
 			MatchJob:      func(n string) bool { return strings.HasSuffix(n, o.testSuffix) },
 			HoldStage:     "Clean Up",
 			TimeoutStages: []string{"Execute Test Cases"},
 			JobTimeout:    o.testTimeout,
-		})
-	}
-	if o.helmJob != "" {
-		specs = append(specs, babysit.Spec{
+		},
+		{
 			Name:          o.helmJob,
 			TriggerStages: []string{"Deploy and Test"},
 			MatchJob:      func(n string) bool { return n == o.helmJob },
@@ -236,9 +210,8 @@ func buildSpecs(o options) []babysit.Spec {
 			// Deploy can't pass on a retry; it needs a fresh commit.
 			NoRetryStages: []string{"Deploy"},
 			Repush:        true,
-		})
+		},
 	}
-	return specs
 }
 
 // pushForNewPipeline commits a junk change, pushes it and returns the new main pipeline.
@@ -292,9 +265,6 @@ func report(outcomes []babysit.Outcome) error {
 }
 
 func resolveBase(repo *git.Repo, o options) (string, error) {
-	if o.base != "" {
-		return o.base, nil
-	}
 	return repo.DefaultBase(o.remote)
 }
 
