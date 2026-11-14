@@ -72,7 +72,7 @@ Pipeline names are bold and underlined, stage names are bold, and everything is 
 | yellow | scheduled, or held back by babysit (Clean Up / Post Clean Up) | a job is paused | |
 | grey | created, skipped, manual | nothing has started | not triggered yet |
 
-`↻N` after a job name means babysit has retried it N times. The dashboard shows no logs. When babysit exits (including on Ctrl-C), the screen is restored and the final dashboard is printed with the results below it, so it stays in your scrollback. When output isn't a terminal (piped or redirected), babysit prints plain log lines instead.
+Green things collapse, since everything in them that has to pass has passed: a green stage shows just its name (no `:` and no jobs), and a green pipeline shows just its name (no stages). `↻N` after a job name means babysit has retried it N times. The dashboard shows no logs. When babysit exits (including on Ctrl-C), the screen is restored and the final dashboard is printed with the results below it, so it stays in your scrollback. When output isn't a terminal (piped or redirected), babysit prints plain log lines instead.
 
 ## Junk changes
 

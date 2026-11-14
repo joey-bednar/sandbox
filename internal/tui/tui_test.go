@@ -104,7 +104,7 @@ func TestFrame(t *testing.T) {
 	}
 	got := plain(d.frame(80), 80)
 	want := `automated-testing
-  Setup:               setup
+  Setup
   Execute Test Cases:  case-a  case-b ↻2  case-c
   Clean Up:            cleanup
 
@@ -126,6 +126,31 @@ helm-charts
 	}
 	if s := lines[5][0]; s.color != Grey {
 		t.Errorf("untriggered pipeline span = %+v", s)
+	}
+}
+
+func TestFrameCollapsesPassedStagesAndPipelines(t *testing.T) {
+	stages := []gitlab.Stage{
+		{Name: "Setup", Jobs: []gitlab.Job{{Name: "setup", Status: "success"}, {Name: "opt", Status: "manual", AllowFailure: true}}},
+		{Name: "Execute Test Cases", Jobs: []gitlab.Job{{Name: "case-a", Status: "running"}, {Name: "case-b", Status: "success"}}},
+	}
+	d := &Dashboard{live: false, closed: true}
+	d.sections = []*section{
+		{name: "running", status: babysit.Status{Phase: babysit.PhaseRunning, Pipeline: &gitlab.Pipeline{Stages: stages}}},
+		{name: "passed", status: babysit.Status{Phase: babysit.PhasePassed, Pipeline: &gitlab.Pipeline{Stages: stages}}},
+	}
+	got := plain(d.frame(80), 80)
+	want := `running
+  Setup
+  Execute Test Cases:  case-a  case-b
+
+passed
+`
+	if got != want {
+		t.Errorf("frame:\n%s\nwant:\n%s", got, want)
+	}
+	if s := d.frame(80)[1][1]; s.color != Green || !s.bold {
+		t.Errorf("passed stage span = %+v", s)
 	}
 }
 

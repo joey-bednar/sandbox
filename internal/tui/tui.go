@@ -191,8 +191,10 @@ func (d *Dashboard) frame(w int) []line {
 
 func (s *section) lines(w int) []line {
 	st := s.status
-	out := []line{{{text: s.name, color: PipelineColor(st), bold: true, underline: true}}}
-	if st.Pipeline == nil {
+	color := PipelineColor(st)
+	out := []line{{{text: s.name, color: color, bold: true, underline: true}}}
+	// A passed pipeline speaks for itself: no stages or jobs.
+	if st.Pipeline == nil || color == Green {
 		return out
 	}
 	labelW := 0
@@ -201,6 +203,12 @@ func (s *section) lines(w int) []line {
 	}
 	for _, stg := range st.Pipeline.Stages {
 		held := st.Holding && gitlab.SameStage(stg.Name, st.HoldStage)
+		stageColor := StageColor(stg.Jobs, held)
+		if stageColor == Green {
+			// Passed: just the name, no ":" or jobs.
+			out = append(out, line{{text: "  "}, {text: stg.Name, color: Green, bold: true}})
+			continue
+		}
 		jobs := make([]span, 0, len(stg.Jobs))
 		for _, j := range stg.Jobs {
 			name := j.Name
@@ -211,7 +219,7 @@ func (s *section) lines(w int) []line {
 		}
 		label := stg.Name + ":"
 		pad := span{text: strings.Repeat(" ", labelW-len([]rune(label))+2)}
-		out = append(out, wrap([]span{{text: "  "}, {text: label, color: StageColor(stg.Jobs, held), bold: true}, pad}, jobs, w)...)
+		out = append(out, wrap([]span{{text: "  "}, {text: label, color: stageColor, bold: true}, pad}, jobs, w)...)
 	}
 	return out
 }
