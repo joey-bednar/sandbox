@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/joey-bednar/sandbox/internal/babysit"
 	"github.com/joey-bednar/sandbox/internal/git"
 	"github.com/joey-bednar/sandbox/internal/gitlab"
 	"github.com/joey-bednar/sandbox/internal/render"
@@ -28,14 +30,26 @@ type options struct {
 	pollInterval time.Duration
 	stages       []string
 	allStages    bool
+	testSuffix   string
+	maxRetries   int
 }
 
 // defaultStages are the stages whose jobs babysit cares about triggering/rerunning.
 var defaultStages = []string{"Monorepo Triggers", "Deploy and Test"}
 
-// Execute runs the root command.
+// Test pipeline stages created by the automated-testing job.
+const (
+	setupStage   = "Setup"
+	executeStage = "Execute Test Cases"
+	cleanupStage = "Clean Up"
+)
+
+// Execute runs the root command. Ctrl-C cancels the context so babysit can
+// report what it left behind (e.g. clean-up jobs it is holding).
 func Execute() {
-	if err := newRootCmd().Execute(); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	if err := newRootCmd().ExecuteContext(ctx); err != nil {
 		os.Exit(1)
 	}
 }
@@ -60,6 +74,8 @@ func newRootCmd() *cobra.Command {
 	f.DurationVar(&o.pollInterval, "poll-interval", 10*time.Second, "how often to poll GitLab")
 	f.StringSliceVar(&o.stages, "stages", defaultStages, "stages to look for in the pipeline and its downstream pipelines (case-insensitive; spaces, '-' and '_' are equivalent)")
 	f.BoolVar(&o.allStages, "all-stages", false, "skip the stage search and show the full pushed pipeline(s)")
+	f.StringVar(&o.testSuffix, "test-job-suffix", "-automated-testing", "trigger and babysit the job with this name suffix; empty disables")
+	f.IntVar(&o.maxRetries, "max-retries", 0, "give up after a job fails this many times (0 = retry forever)")
 	_ = cmd.MarkFlagRequired("message")
 	return cmd
 }
@@ -154,6 +170,48 @@ func run(ctx context.Context, o options) error {
 		fmt.Println()
 		render.Tree(os.Stdout, filtered, color)
 	}
+	if o.testSuffix == "" {
+		return nil
+	}
+	// Pipelines are newest first; babysit the tests in the newest one.
+	return runTests(ctx, client, matches[0], o)
+}
+
+func runTests(ctx context.Context, client *gitlab.Client, m gitlab.StageMatch, o options) error {
+	filtered, _ := gitlab.FilterStages(m.Pipeline, o.stages)
+	testJob, err := babysit.FindTestJob(filtered, o.testSuffix)
+	if err != nil {
+		return err
+	}
+
+	start := time.Now()
+	tr := &babysit.TestRun{
+		API:          client,
+		Interval:     o.pollInterval,
+		MaxRetries:   o.maxRetries,
+		SetupStage:   setupStage,
+		ExecuteStage: executeStage,
+		CleanupStage: cleanupStage,
+		Log: func(msg string) {
+			fmt.Printf("  [%s] %s\n", time.Since(start).Round(time.Second), msg)
+		},
+	}
+
+	fmt.Printf("\nTriggering %s...\n", testJob.Name)
+	ref, err := tr.Trigger(ctx, m.Pipeline.Project, m.Pipeline.IID, testJob.Name)
+	if err != nil {
+		return err
+	}
+	tp, err := client.GetPipeline(ctx, ref.Project, ref.IID, 0)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("\nBabysitting test pipeline #%s: %s\n", tp.IID, tp.WebURL)
+	if err := tr.Babysit(ctx, *ref); err != nil {
+		return err
+	}
+
+	fmt.Printf("\nDone. Pipelines for your MR:\n  main:  %s\n  tests: %s\n", m.Pipeline.WebURL, tp.WebURL)
 	return nil
 }
 

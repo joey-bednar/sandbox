@@ -94,7 +94,7 @@ func (c *Client) WaitForStages(ctx context.Context, project, sha string, names [
 	for {
 		matches, done, err := c.pollStages(ctx, project, sha, names, progress)
 		switch {
-		case err != nil && ctx.Err() == nil && !transient(err):
+		case err != nil && ctx.Err() == nil && !IsTransient(err):
 			return nil, err
 		case err != nil && ctx.Err() == nil:
 			progress(fmt.Sprintf("transient error, retrying: %v", err))
@@ -144,7 +144,8 @@ func (c *Client) pollStages(ctx context.Context, project, sha string, names []st
 	return matches, done, nil
 }
 
-func transient(err error) bool {
+// IsTransient reports whether err is worth retrying (network error or HTTP 5xx).
+func IsTransient(err error) bool {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
 		return apiErr.StatusCode >= 500

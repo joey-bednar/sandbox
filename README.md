@@ -9,7 +9,7 @@ Current scope: commit and push the staged changes, then poll GitLab until the wa
 Run it from the repo you want to babysit, pointing `go run -C` at this checkout:
 
 ```sh
-export GITLAB_API_KEY=glpat-...   # needs read_api (api for future retry features)
+export GITLAB_API_KEY=glpat-...   # needs the api scope (babysit plays, retries and cancels jobs)
 cd ~/work/your-gitlab-repo
 git add -p
 go run -C ~/sandbox . -m "Fix the thing"
@@ -31,6 +31,18 @@ Host and project are derived from the `origin` remote. Override as needed:
 | `--poll-interval` | `10s` | How often to poll GitLab |
 | `--stages` | `Monorepo Triggers,Deploy and Test` | Stages to look for in the pushed pipeline and its downstream pipelines (case-insensitive; spaces, `-`, `_` equivalent) |
 | `--all-stages` | `false` | Skip the stage search and show the full pushed pipeline(s) |
+| `--test-job-suffix` | `-automated-testing` | Trigger and babysit the job ending in this suffix; empty disables |
+| `--max-retries` | `0` | Give up after a job fails this many times (0 = retry forever) |
+
+## Test babysitting
+
+After the stages are found, babysit triggers the one job ending in `-automated-testing`. It waits for that job to become playable, plays it, and follows the pipeline it creates. On every poll of that pipeline it then:
+
+1. Holds **Clean Up**: it cancels any Clean Up job that is queued or running. This repeats on every poll because GitLab re-queues skipped Clean Up jobs whenever an earlier job is retried.
+2. Retries every failed job in **Setup** and **Execute Test Cases**. Test cases only run after Setup passes, so in practice it finishes Setup first.
+3. Once every Setup and Execute Test Cases job has passed, it retries the canceled Clean Up jobs so they run, then prints the pipeline links for your MR.
+
+If you stop babysit (Ctrl-C) before it finishes, Clean Up jobs it canceled stay canceled. It prints the test pipeline link so you can retry them by hand.
 
 Example output:
 

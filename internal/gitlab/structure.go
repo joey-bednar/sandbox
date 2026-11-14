@@ -36,7 +36,16 @@ type Job struct {
 	AllowFailure bool
 	Bridge       bool
 	WebURL       string
-	Downstream   *Pipeline // non-nil for trigger jobs whose downstream pipeline exists
+	// DownstreamRef identifies the pipeline a trigger job created, if any.
+	// Downstream holds its full structure when it was fetched recursively.
+	DownstreamRef *PipelineRef
+	Downstream    *Pipeline
+}
+
+// PipelineRef identifies a pipeline by project path and IID.
+type PipelineRef struct {
+	Project string
+	IID     string
 }
 
 const pipelineStructureQuery = `
@@ -107,10 +116,17 @@ type gqlPipelineResponse struct {
 // GetPipelineStructure fetches the stages and jobs of pipeline iid in project,
 // recursing into downstream pipelines up to MaxDownstreamDepth levels.
 func (c *Client) GetPipelineStructure(ctx context.Context, project string, iid int) (*Pipeline, error) {
-	return c.getStructure(ctx, project, fmt.Sprint(iid), 0, map[string]bool{})
+	return c.GetPipeline(ctx, project, fmt.Sprint(iid), MaxDownstreamDepth)
 }
 
-func (c *Client) getStructure(ctx context.Context, project, iid string, depth int, visited map[string]bool) (*Pipeline, error) {
+// GetPipeline fetches pipeline iid in project, recursing into downstream
+// pipelines up to maxDepth levels. With maxDepth 0 only DownstreamRef is set
+// on trigger jobs, which is much cheaper when polling.
+func (c *Client) GetPipeline(ctx context.Context, project, iid string, maxDepth int) (*Pipeline, error) {
+	return c.getStructure(ctx, project, iid, 0, maxDepth, map[string]bool{})
+}
+
+func (c *Client) getStructure(ctx context.Context, project, iid string, depth, maxDepth int, visited map[string]bool) (*Pipeline, error) {
 	key := project + "#" + iid
 	visited[key] = true
 
@@ -148,10 +164,13 @@ func (c *Client) getStructure(ctx context.Context, project, iid string, depth in
 					Bridge:       gj.Kind == "BRIDGE",
 					WebURL:       c.webURL(gj.WebPath),
 				}
-				if ds := gj.DownstreamPipeline; ds != nil && depth < MaxDownstreamDepth {
-					dsKey := ds.Project.FullPath + "#" + ds.IID
+				if ds := gj.DownstreamPipeline; ds != nil {
+					j.DownstreamRef = &PipelineRef{Project: ds.Project.FullPath, IID: ds.IID}
+				}
+				if ds := j.DownstreamRef; ds != nil && depth < maxDepth {
+					dsKey := ds.Project + "#" + ds.IID
 					if !visited[dsKey] {
-						child, err := c.getStructure(ctx, ds.Project.FullPath, ds.IID, depth+1, visited)
+						child, err := c.getStructure(ctx, ds.Project, ds.IID, depth+1, maxDepth, visited)
 						if err != nil {
 							return nil, err
 						}
