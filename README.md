@@ -41,17 +41,26 @@ Host and project are derived from the `origin` remote. Override as needed:
 
 ## Display
 
-In a terminal, babysit takes over the screen with a live dashboard that is redrawn whenever any pipeline changes (and when the terminal is resized). At the top are the commit, the main pipeline and the git/setup log. Below that there is one section each for automated-testing and helm-charts. Each section shows its phase and pipeline link, every job grouped by stage, and its last few log lines. Job names are colored by state:
+In a terminal, babysit takes over the screen with a live dashboard that shows only the babysat pipelines, automated-testing and helm-charts. It is redrawn whenever any pipeline changes (and when the terminal is resized). Each section lists the pipeline's stages and their jobs:
 
-| Color | Meaning | GitLab statuses |
-| --- | --- | --- |
-| blue | running | running, pending, preparing, waiting_for_resource |
-| green | passed | success |
-| red | failed | failed, canceled (babysit will retry it) |
-| yellow | paused | manual, scheduled, or held back by babysit (Clean Up / Post Clean Up) |
-| grey | not triggered yet | created, skipped, or a trigger job that hasn't been played |
+```
+automated-testing
+  Setup:               setup-env  setup-db ↻1
+  Execute Test Cases:  case-login  case-search  case-checkout
+  Clean Up:            teardown
+```
 
-`↻N` after a job name means babysit has retried it N times. When babysit exits (including on Ctrl-C), the screen is restored and the final dashboard is printed with the results below it, so it stays in your scrollback. When output isn't a terminal (piped or redirected), babysit prints plain log lines instead.
+Pipeline names are bold and underlined, stage names are bold, and everything is colored by state:
+
+| Color | Job | Stage | Pipeline |
+| --- | --- | --- | --- |
+| blue | running, pending, preparing, waiting_for_resource | a job is running, or some passed and others haven't started | triggered and being babysat |
+| green | success | every started job passed | passed |
+| red | failed, canceled (babysit will retry it) | a job failed | failed (e.g. too many retries or pushes) |
+| yellow | scheduled, or held back by babysit (Clean Up / Post Clean Up) | a job is paused | |
+| grey | created, skipped, manual | nothing has started | not triggered yet |
+
+`↻N` after a job name means babysit has retried it N times. The dashboard shows no logs. When babysit exits (including on Ctrl-C), the screen is restored and the final dashboard is printed with the results below it, so it stays in your scrollback. When output isn't a terminal (piped or redirected), babysit prints plain log lines instead.
 
 ## Junk changes
 

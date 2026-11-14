@@ -2,7 +2,6 @@ package tui
 
 import (
 	"bytes"
-	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -22,7 +21,8 @@ func TestJobColor(t *testing.T) {
 		{"success", false, Green},
 		{"failed", false, Red},
 		{"canceled", false, Red},
-		{"manual", false, Yellow},
+		{"manual", false, Grey},
+		{"scheduled", false, Yellow},
 		{"created", false, Grey},
 		{"skipped", false, Grey},
 		// held back by babysit: paused, unless already finished
@@ -30,6 +30,7 @@ func TestJobColor(t *testing.T) {
 		{"created", true, Yellow},
 		{"success", true, Green},
 		{"failed", true, Red},
+		{"manual", true, Grey},
 	}
 	for _, c := range cases {
 		if got := JobColor(gitlab.Job{Status: c.status}, c.held); got != c.want {
@@ -46,8 +47,41 @@ func plain(ls []line, w int) string {
 	return b.String()
 }
 
+func TestStageAndPipelineColor(t *testing.T) {
+	for _, c := range []struct {
+		jobs []Color
+		want Color
+	}{
+		{[]Color{Green, Red, Blue}, Red},
+		{[]Color{Green, Blue}, Blue},
+		{[]Color{Yellow, Green}, Yellow},
+		{[]Color{Grey, Grey}, Grey},
+		{[]Color{Green, Green}, Green},
+		{[]Color{Green, Grey}, Blue},
+	} {
+		if got := StageColor(c.jobs); got != c.want {
+			t.Errorf("StageColor(%v) = %v, want %v", c.jobs, got, c.want)
+		}
+	}
+	for _, c := range []struct {
+		st   babysit.Status
+		want Color
+	}{
+		{babysit.Status{Phase: babysit.PhaseWaiting}, Grey},
+		{babysit.Status{Phase: babysit.PhaseTriggering, Trigger: &gitlab.Job{Status: "manual"}}, Grey},
+		{babysit.Status{Phase: babysit.PhaseTriggering, Trigger: &gitlab.Job{Status: "running"}}, Blue},
+		{babysit.Status{Phase: babysit.PhaseCleanup}, Blue},
+		{babysit.Status{Phase: babysit.PhasePassed}, Green},
+		{babysit.Status{Phase: babysit.PhaseFailed}, Red},
+	} {
+		if got := PipelineColor(c.st); got != c.want {
+			t.Errorf("PipelineColor(%+v) = %v, want %v", c.st, got, c.want)
+		}
+	}
+}
+
 func TestFrame(t *testing.T) {
-	d := &Dashboard{title: "babysit  g/p  (feat)", live: false, closed: true}
+	d := &Dashboard{live: false, closed: true}
 	d.sections = []*section{
 		{name: "automated-testing", status: babysit.Status{
 			Phase: babysit.PhaseRunning, HoldStage: "Clean Up", Holding: true,
@@ -58,37 +92,38 @@ func TestFrame(t *testing.T) {
 					{Name: "case-a", Status: "running"}, {Name: "case-b", Status: "failed"}, {Name: "case-c", Status: "created"}}},
 				{Name: "Clean Up", Jobs: []gitlab.Job{{Name: "cleanup", Status: "canceled"}}},
 			}},
-		}, logs: []string{"[1m0s] retrying Execute Test Cases job case-b"}},
+		}},
 		{name: "helm-charts", status: babysit.Status{Phase: babysit.PhaseTriggering, Trigger: &gitlab.Job{Name: "helm-charts", Status: "manual"}}},
-		{name: "other", status: babysit.Status{Phase: babysit.PhaseFailed, Err: errors.New("boom"), Pushes: 1}},
 	}
-	d.info = [][2]string{{"commit", "abc123 msg"}, {"main pipeline", "#201 https://gl/p/-/pipelines/201"}}
 	got := plain(d.frame(80), 80)
-	want := `babysit  g/p  (feat)
-■ running   ■ passed   ■ failed   ■ paused   ■ not triggered
-commit         abc123 msg
-main pipeline  #201 https://gl/p/-/pipelines/201
+	want := `automated-testing
+  Setup:               setup
+  Execute Test Cases:  case-a  case-b ↻2  case-c
+  Clean Up:            cleanup
 
-automated-testing  RUNNING  #301 https://gl/t/-/pipelines/301
-  Setup               setup
-  Execute Test Cases  case-a  case-b ↻2  case-c
-  Clean Up            cleanup
-  [1m0s] retrying Execute Test Cases job case-b
-
-helm-charts  TRIGGERING
-  trigger job  helm-charts
-
-other  FAILED  (1 new push(es))
-  boom
-  not triggered yet
+helm-charts
 `
 	if got != want {
 		t.Errorf("frame:\n%s\nwant:\n%s", got, want)
 	}
+	// Styling: pipeline bold+underlined, stage bold with its color, jobs colored.
+	lines := d.frame(80)
+	if s := lines[0][0]; !s.bold || !s.underline || s.color != Blue {
+		t.Errorf("pipeline span = %+v", s)
+	}
+	if s := lines[2][1]; s.text != "Execute Test Cases:" || !s.bold || s.color != Red {
+		t.Errorf("stage span = %+v", s)
+	}
+	if s := lines[3][3]; s.text != "cleanup" || s.color != Yellow {
+		t.Errorf("held job span = %+v", s)
+	}
+	if s := lines[5][0]; s.color != Grey {
+		t.Errorf("untriggered pipeline span = %+v", s)
+	}
 }
 
 func TestWrapAndTruncate(t *testing.T) {
-	ls := wrap(span{text: "  S  "}, []span{{text: "aaaa"}, {text: "bbbb"}, {text: "cccc"}}, 16)
+	ls := wrap([]span{{text: "  S  "}}, []span{{text: "aaaa"}, {text: "bbbb"}, {text: "cccc"}}, 16)
 	if got := plain(ls, 16); got != "  S  aaaa  bbbb\n     cccc\n" {
 		t.Errorf("wrap = %q", got)
 	}
@@ -103,9 +138,9 @@ func TestWrapAndTruncate(t *testing.T) {
 func TestRedrawSkipsIdenticalFramesAndTruncatesHeight(t *testing.T) {
 	var buf bytes.Buffer
 	height := 3
-	d := &Dashboard{out: &buf, live: true, start: time.Now(), title: "t",
+	d := &Dashboard{out: &buf, live: true, start: time.Now(),
 		size: func() (int, int) { return 40, height }}
-	d.sections = []*section{{name: "s", status: babysit.Status{Phase: babysit.PhaseWaiting}}}
+	d.sections = []*section{{name: "s", status: babysit.Status{Phase: babysit.PhaseWaiting}}, {name: "t"}, {name: "u"}}
 	d.redraw()
 	if !strings.Contains(buf.String(), "more line(s)") {
 		t.Errorf("expected truncation note in %q", buf.String())

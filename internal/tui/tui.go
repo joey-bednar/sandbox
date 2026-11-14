@@ -1,6 +1,6 @@
 // Package tui draws babysit's live dashboard: one section per babysat
-// pipeline (helm-charts, automated-testing), listing every job colored by
-// state, fully redrawn whenever anything changes.
+// pipeline (automated-testing, helm-charts) listing its stages and jobs,
+// each colored by state, fully redrawn whenever anything changes.
 //
 // When output is not a terminal the dashboard degrades to plain log lines.
 package tui
@@ -20,9 +20,6 @@ import (
 	"github.com/joey-bednar/sandbox/internal/gitlab"
 )
 
-// logLines is how many recent log lines each section keeps.
-const logLines = 4
-
 // Dashboard is safe for concurrent use.
 type Dashboard struct {
 	mu     sync.Mutex
@@ -33,9 +30,6 @@ type Dashboard struct {
 	closed bool
 	last   string // last frame written, to skip identical redraws
 
-	title    string
-	info     [][2]string // key/value lines under the title
-	setupLog []string
 	sections []*section
 	stopResz func()
 }
@@ -43,14 +37,13 @@ type Dashboard struct {
 type section struct {
 	name   string
 	status babysit.Status
-	logs   []string
 }
 
 // New returns a dashboard writing to f. It goes full screen only if f is a
 // terminal and live is true; call Close to restore the screen.
-func New(f *os.File, live bool, title string, sections ...string) *Dashboard {
+func New(f *os.File, live bool, sections ...string) *Dashboard {
 	live = live && term.IsTerminal(int(f.Fd()))
-	d := &Dashboard{out: f, live: live, start: time.Now(), title: title}
+	d := &Dashboard{out: f, live: live, start: time.Now()}
 	d.size = func() (int, int) {
 		w, h, err := term.GetSize(int(f.Fd()))
 		if err != nil || w <= 0 || h <= 0 {
@@ -73,45 +66,28 @@ func New(f *os.File, live bool, title string, sections ...string) *Dashboard {
 // Live reports whether the dashboard is drawing full screen.
 func (d *Dashboard) Live() bool { return d.live }
 
-// Info sets a key/value line under the title (e.g. "commit", "main pipeline").
+// Info prints a key/value line in plain mode. The live dashboard doesn't show it.
 func (d *Dashboard) Info(key, value string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if !d.live && !d.closed {
 		fmt.Fprintf(d.out, "%s: %s\n", key, value)
 	}
-	defer d.redraw()
-	for i := range d.info {
-		if d.info[i][0] == key {
-			d.info[i][1] = value
-			return
-		}
-	}
-	d.info = append(d.info, [2]string{key, value})
 }
 
-// Log adds a line to section's log ("" is the general log under the title).
+// Log prints a log line in plain mode, tagged with sectionName unless it is
+// empty. The live dashboard shows no logs, so there it is dropped.
 func (d *Dashboard) Log(sectionName, msg string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	stamp := fmt.Sprintf("[%s] ", time.Since(d.start).Round(time.Second))
-	if !d.live || d.closed {
-		tag := ""
-		if sectionName != "" {
-			tag = "[" + sectionName + "] "
-		}
-		fmt.Fprintf(d.out, "  %s%s%s\n", stamp, tag, msg)
+	if d.live {
 		return
 	}
-	logs := &d.setupLog
-	if s := d.section(sectionName); s != nil {
-		logs = &s.logs
+	tag := ""
+	if sectionName != "" {
+		tag = "[" + sectionName + "] "
 	}
-	*logs = append(*logs, stamp+msg)
-	if len(*logs) > logLines {
-		*logs = (*logs)[len(*logs)-logLines:]
-	}
-	d.redraw()
+	fmt.Fprintf(d.out, "  [%s] %s%s\n", time.Since(d.start).Round(time.Second), tag, msg)
 }
 
 // Writer returns a writer that logs each line written to it under sectionName.
@@ -200,105 +176,54 @@ func (d *Dashboard) redraw() {
 // frame lays out the whole dashboard for width w.
 func (d *Dashboard) frame(w int) []line {
 	var out []line
-	out = append(out, line{{text: d.title, bold: true}})
-	out = append(out, legend())
-	keyW := 0
-	for _, kv := range d.info {
-		keyW = max(keyW, len(kv[0]))
-	}
-	for _, kv := range d.info {
-		out = append(out, line{{text: fmt.Sprintf("%-*s  ", keyW, kv[0]), dim: true}, {text: kv[1]}})
-	}
-	for _, l := range d.setupLog {
-		out = append(out, line{{text: "  " + l, dim: true}})
-	}
-	for _, s := range d.sections {
-		out = append(out, line{})
+	for i, s := range d.sections {
+		if i > 0 {
+			out = append(out, line{})
+		}
 		out = append(out, s.lines(w)...)
 	}
 	return out
 }
 
-func legend() line {
-	var l line
-	for _, e := range []struct {
-		c    Color
-		name string
-	}{{Blue, "running"}, {Green, "passed"}, {Red, "failed"}, {Yellow, "paused"}, {Grey, "not triggered"}} {
-		l = append(l, span{text: "■ ", color: e.c}, span{text: e.name + "   ", dim: true})
-	}
-	return l
-}
-
 func (s *section) lines(w int) []line {
 	st := s.status
-	head := line{{text: s.name, bold: true, underline: true}, {text: "  "}, phaseSpan(st.Phase)}
-	if st.Pipeline != nil {
-		head = append(head, span{text: fmt.Sprintf("  #%s %s", st.Pipeline.IID, st.Pipeline.WebURL), dim: true})
+	out := []line{{{text: s.name, color: PipelineColor(st), bold: true, underline: true}}}
+	if st.Pipeline == nil {
+		return out
 	}
-	if st.Pushes > 0 {
-		head = append(head, span{text: fmt.Sprintf("  (%d new push(es))", st.Pushes), dim: true})
+	labelW := 0
+	for _, stg := range st.Pipeline.Stages {
+		labelW = max(labelW, len([]rune(stg.Name))+1)
 	}
-	out := []line{head}
-	if st.Err != nil {
-		out = append(out, line{{text: "  " + st.Err.Error(), color: Red}})
-	}
-
-	switch {
-	case st.Pipeline != nil:
-		labelW := 0
-		for _, stg := range st.Pipeline.Stages {
-			labelW = max(labelW, len(stg.Name))
-		}
-		for _, stg := range st.Pipeline.Stages {
-			held := st.Holding && gitlab.SameStage(stg.Name, st.HoldStage)
-			var jobs []span
-			for _, j := range stg.Jobs {
-				name := j.Name
-				if n := st.Retries[j.Name]; n > 0 {
-					name += fmt.Sprintf(" ↻%d", n)
-				}
-				jobs = append(jobs, span{text: name, color: JobColor(j, held)})
+	for _, stg := range st.Pipeline.Stages {
+		held := st.Holding && gitlab.SameStage(stg.Name, st.HoldStage)
+		jobs := make([]span, 0, len(stg.Jobs))
+		colors := make([]Color, 0, len(stg.Jobs))
+		for _, j := range stg.Jobs {
+			name := j.Name
+			if n := st.Retries[j.Name]; n > 0 {
+				name += fmt.Sprintf(" ↻%d", n)
 			}
-			label := fmt.Sprintf("  %-*s  ", labelW, stg.Name)
-			out = append(out, wrap(span{text: label, dim: true}, jobs, w)...)
+			c := JobColor(j, held)
+			colors = append(colors, c)
+			jobs = append(jobs, span{text: name, color: c})
 		}
-	case st.Trigger != nil:
-		c := JobColor(*st.Trigger, false)
-		if st.Trigger.Status == "manual" {
-			c = Grey // not played yet: nothing has been triggered
-		}
-		out = append(out, line{{text: "  trigger job  ", dim: true}, {text: st.Trigger.Name, color: c}})
-	default:
-		out = append(out, line{{text: "  not triggered yet", color: Grey}})
-	}
-	for _, l := range s.logs {
-		out = append(out, line{{text: "  " + l, dim: true}})
+		label := stg.Name + ":"
+		pad := span{text: strings.Repeat(" ", labelW-len([]rune(label))+2)}
+		out = append(out, wrap([]span{{text: "  "}, {text: label, color: StageColor(colors), bold: true}, pad}, jobs, w)...)
 	}
 	return out
 }
 
-func phaseSpan(p babysit.Phase) span {
-	s := span{text: strings.ToUpper(string(p)), bold: true}
-	switch p {
-	case babysit.PhasePassed:
-		s.color = Green
-	case babysit.PhaseFailed:
-		s.color = Red
-	case babysit.PhaseRunning, babysit.PhaseCleanup, babysit.PhaseTriggering, babysit.PhasePushing:
-		s.color = Blue
-	default:
-		s.color = Grey
+// wrap lays out prefix followed by items separated by two spaces, continuing
+// on lines indented to the prefix's width when the width runs out.
+func wrap(prefix []span, items []span, w int) []line {
+	used := 0
+	for _, p := range prefix {
+		used += len([]rune(p.text))
 	}
-	return s
-}
-
-// wrap lays out label followed by items separated by two spaces, continuing
-// on indented lines when the width runs out.
-func wrap(label span, items []span, w int) []line {
-	indent := strings.Repeat(" ", len([]rune(label.text)))
-	cur := line{label}
-	used := len([]rune(label.text))
+	indent := strings.Repeat(" ", used)
+	cur := append(line{}, prefix...)
 	var out []line
 	for i, it := range items {
 		n := len([]rune(it.text))

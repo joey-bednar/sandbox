@@ -112,7 +112,7 @@ func run(ctx context.Context, o options) error {
 	}
 	// Full screen only when there is something to babysit; --all-stages
 	// prints a one-off tree instead.
-	d := tui.New(os.Stdout, !o.allStages && len(specs) > 0, fmt.Sprintf("babysit  %s  (%s)", project, branch), names...)
+	d := tui.New(os.Stdout, !o.allStages && len(specs) > 0, names...)
 	defer d.Close()
 	gitOut := d.Writer("")
 	repo.Stdout, repo.Stderr = gitOut, gitOut
