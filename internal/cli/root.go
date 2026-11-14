@@ -36,6 +36,7 @@ type options struct {
 	testTimeout  time.Duration
 	helmJob      string
 	maxPushes    int
+	upgrade      bool // play helm-charts' Setup job containing "upgrade"
 }
 
 func defaultOptions() options {
@@ -76,6 +77,7 @@ func newRootCmd() *cobra.Command {
 		},
 	}
 	f := cmd.Flags()
+	f.BoolVar(&o.upgrade, "upgrade", false, `in helm-charts, play the manual "Setup" job whose name contains "upgrade"`)
 	f.StringVar(&o.host, "debug-host", "", "GitLab host or base URL instead of the one from the remote")
 	f.StringVar(&o.project, "debug-project", "", "GitLab project path instead of the one from the remote")
 	f.DurationVar(&o.pollInterval, "debug-poll-interval", o.pollInterval, "how often to poll GitLab")
@@ -193,7 +195,7 @@ func waitForMain(ctx context.Context, client *gitlab.Client, project, sha string
 
 // buildSpecs describes the triggered pipelines to babysit.
 func buildSpecs(o options) []babysit.Spec {
-	return []babysit.Spec{
+	specs := []babysit.Spec{
 		{
 			Name:          strings.TrimPrefix(o.testSuffix, "-"),
 			TriggerStages: o.stages,
@@ -212,6 +214,11 @@ func buildSpecs(o options) []babysit.Spec {
 			Repush:        true,
 		},
 	}
+	if o.upgrade {
+		specs[1].PlayStage = "Setup"
+		specs[1].PlayJob = func(n string) bool { return strings.Contains(strings.ToLower(n), "upgrade") }
+	}
+	return specs
 }
 
 // pushForNewPipeline commits a junk change, pushes it and returns the new main pipeline.

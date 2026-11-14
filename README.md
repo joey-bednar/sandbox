@@ -12,15 +12,18 @@ Run it from the repo you want to babysit, pointing `go run -C` at this checkout:
 export GITLAB_API_KEY=glpat-...   # needs the api scope (babysit plays, retries and cancels jobs)
 cd ~/work/your-gitlab-repo
 git add -p
-go run -C ~/sandbox .   # commits what you staged, or a junk change if nothing is
-                        # staged, with the message "Get passing pipelines"
+go run -C ~/sandbox .             # commits what you staged, or a junk change if nothing is
+                                  # staged, with the message "Get passing pipelines"
+go run -C ~/sandbox . --upgrade   # also play helm-charts' upgrade job (see below)
 ```
 
 `-C` makes Go build from this checkout, and babysit runs git in the directory you
 invoked it from (via `$PWD`). Plain `go run ~/sandbox` cannot work from another
 repo, because Go resolves the module from the current directory.
 
-babysit takes no options. The GitLab host and project come from the `origin` remote, and these settings are fixed:
+The only option is `--upgrade`: in the helm-charts pipeline, babysit plays the manual job in the "Setup" stage whose name contains "upgrade" (case-insensitive). helm-charts doesn't count as passed until that job has run and passed; if it fails it is retried like any other job. If the pipeline has no such job, helm-charts fails instead of passing without it. Without `--upgrade` the job is left alone.
+
+The GitLab host and project come from the `origin` remote, and these settings are fixed:
 
 | Setting | Value |
 | --- | --- |
@@ -71,6 +74,7 @@ After the main pipeline is found, babysit triggers two jobs from it and babysits
 | Trigger job | ends in `-automated-testing`, in "Monorepo Triggers" or "Deploy and Test" | exactly `helm-charts`, in "Deploy and Test" |
 | Held stage | Clean Up | Post Clean Up |
 | Never retried | (none) | Deploy |
+| Played by babysit | (none) | with `--upgrade`: the Setup job containing "upgrade" |
 | Restarted if running > 20m | Execute Test Cases | (none) |
 
 Each triggered pipeline goes through the same steps. On every poll:

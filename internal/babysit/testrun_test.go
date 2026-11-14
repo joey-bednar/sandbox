@@ -474,3 +474,56 @@ func TestCoordinatorObservesEveryPhase(t *testing.T) {
 		t.Errorf("holding = %v", holding)
 	}
 }
+
+func upgradeSpec() Spec {
+	s := helmSpec
+	s.PlayStage = "setup"
+	s.PlayJob = func(n string) bool { return strings.Contains(n, "upgrade") }
+	return s
+}
+
+func helmWithSetup(iid string, setup []gitlab.Job, cleanup ...gitlab.Job) *gitlab.Pipeline {
+	return pipeline(iid,
+		stage("Setup", setup...),
+		stage("Deploy", job("deploy", "success")),
+		stage("Post Clean Up", cleanup...))
+}
+
+func TestBabysitPlaysUpgradeJobBeforeReleasing(t *testing.T) {
+	optionalManual := func(id string) gitlab.Job {
+		j := job(id, "manual")
+		j.AllowFailure = true // optional: would otherwise count as passed
+		return j
+	}
+	api := newFake(map[string][]*gitlab.Pipeline{"5": {
+		helmWithSetup("5", []gitlab.Job{job("setup", "success"), optionalManual("helm-upgrade"), optionalManual("other")}, job("pc", "created")),
+		helmWithSetup("5", []gitlab.Job{job("setup", "success"), job("helm-upgrade", "failed"), optionalManual("other")}, job("pc", "canceled")),
+		helmWithSetup("5", []gitlab.Job{job("setup", "success"), job("helm-upgrade", "success"), optionalManual("other")}, job("pc", "canceled")),
+		helmWithSetup("5", []gitlab.Job{job("setup", "success"), job("helm-upgrade", "success"), optionalManual("other")}, job("pc", "success")),
+	}})
+	res, err := newRun(api, upgradeSpec()).Babysit(context.Background(), gitlab.PipelineRef{IID: "5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Passed {
+		t.Fatalf("result = %+v", res)
+	}
+	// Played (only the upgrade job), retried when it failed, released after.
+	want := []string{"cancel:pc", "play:helm-upgrade", "retry:helm-upgrade", "retry:pc"}
+	if !slices.Equal(api.calls, want) {
+		t.Errorf("calls = %v, want %v", api.calls, want)
+	}
+}
+
+func TestBabysitFailsWithoutUpgradeJob(t *testing.T) {
+	api := newFake(map[string][]*gitlab.Pipeline{"5": {
+		helmWithSetup("5", []gitlab.Job{job("setup", "success")}, job("pc", "created")),
+	}})
+	_, err := newRun(api, upgradeSpec()).Babysit(context.Background(), gitlab.PipelineRef{IID: "5"})
+	if err == nil || !strings.Contains(err.Error(), "no matching job to play") {
+		t.Fatalf("err = %v", err)
+	}
+	if len(api.calls) != 0 {
+		t.Errorf("calls = %v", api.calls)
+	}
+}

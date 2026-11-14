@@ -35,6 +35,11 @@ type Spec struct {
 	// then retried like any other canceled job. JobTimeout 0 disables this.
 	TimeoutStages []string
 	JobTimeout    time.Duration
+	// Manual jobs in PlayStage matching PlayJob are played by babysit, and
+	// the pipeline doesn't pass until they have run. At least one must
+	// exist. PlayJob nil disables this.
+	PlayStage string
+	PlayJob   func(name string) bool
 }
 
 // TestRun babysits one triggered pipeline according to Spec.
@@ -177,6 +182,9 @@ func (t *TestRun) Babysit(ctx context.Context, ref gitlab.PipelineRef) (*Result,
 			if err != nil {
 				return nil, err
 			}
+			if err := t.checkPlayable(p); err != nil {
+				return nil, err
+			}
 			switch {
 			case res == nil:
 				if res, err = t.running(ctx, p, hold, rest); err != nil {
@@ -214,6 +222,7 @@ func (t *TestRun) Babysit(ctx context.Context, ref gitlab.PipelineRef) (*Result,
 func (t *TestRun) running(ctx context.Context, p *gitlab.Pipeline, hold *gitlab.Stage, rest []gitlab.Stage) (*Result, error) {
 	allPassed := true
 	var blocking []string
+	var toPlay []gitlab.Job
 	for _, s := range rest {
 		noRetry := t.noRetry(s.Name)
 		for _, j := range s.Jobs {
@@ -221,10 +230,17 @@ func (t *TestRun) running(ctx context.Context, p *gitlab.Pipeline, hold *gitlab.
 				t.log("%s job %s %s; it can't pass by retrying %s", s.Name, j.Name, j.Status, j.WebURL)
 				return &Result{FailedJob: j.Name}, nil
 			}
-			if j.Status == "manual" && !j.AllowFailure {
+			switch {
+			case j.Status == "manual" && t.playable(s.Name, j.Name):
+				// Not passed even if optional: babysit is about to run it.
+				toPlay = append(toPlay, j)
+				allPassed = false
+			case j.Status == "manual" && !j.AllowFailure:
 				blocking = append(blocking, j.Name)
+				allPassed = false
+			default:
+				allPassed = allPassed && JobPassed(j)
 			}
-			allPassed = allPassed && JobPassed(j)
 		}
 	}
 	if msg := fmt.Sprintf("waiting on blocking manual job(s) %q; babysit does not play these, start them in GitLab", blocking); len(blocking) > 0 && msg != t.lastWait {
@@ -248,6 +264,15 @@ func (t *TestRun) running(ctx context.Context, p *gitlab.Pipeline, hold *gitlab.
 			if ok {
 				t.log("holding %s job %s (canceled)", hold.Name, j.Name)
 			}
+		}
+	}
+	for _, j := range toPlay {
+		ok, err := t.mutate("playing "+j.Name, func() error { return t.API.PlayJob(ctx, j.ID) })
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			t.log("played manual job %s %s", j.Name, j.WebURL)
 		}
 	}
 	if err := t.cancelOverdue(ctx, rest); err != nil {
@@ -357,6 +382,28 @@ func (t *TestRun) split(p *gitlab.Pipeline) (hold *gitlab.Stage, rest []gitlab.S
 		}
 	}
 	return hold, rest, nil
+}
+
+// playable reports whether job name in stage is one babysit plays itself.
+func (t *TestRun) playable(stage, name string) bool {
+	return t.Spec.PlayJob != nil && gitlab.SameStage(stage, t.Spec.PlayStage) && t.Spec.PlayJob(name)
+}
+
+// checkPlayable fails when Spec asks for jobs to be played but p has none,
+// so babysit doesn't report a pipeline as passing without them.
+func (t *TestRun) checkPlayable(p *gitlab.Pipeline) error {
+	if t.Spec.PlayJob == nil {
+		return nil
+	}
+	for _, s := range p.Stages {
+		for _, j := range s.Jobs {
+			if t.playable(s.Name, j.Name) {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("%s pipeline #%s has no matching job to play in stage %q (%s)",
+		t.Spec.Name, p.IID, t.Spec.PlayStage, pipelineURL(p, gitlab.PipelineRef{}))
 }
 
 func (t *TestRun) noRetry(stage string) bool {
