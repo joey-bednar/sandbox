@@ -9,7 +9,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -18,6 +17,7 @@ import (
 	"github.com/joey-bednar/sandbox/internal/git"
 	"github.com/joey-bednar/sandbox/internal/gitlab"
 	"github.com/joey-bednar/sandbox/internal/render"
+	"github.com/joey-bednar/sandbox/internal/tui"
 )
 
 const tokenEnv = "GITLAB_API_KEY"
@@ -92,7 +92,7 @@ func run(ctx context.Context, o options) error {
 		return errors.New("commit message must not be empty")
 	}
 
-	repo := &git.Repo{Dir: callerDir(), Stdout: os.Stdout, Stderr: os.Stderr}
+	repo := &git.Repo{Dir: callerDir()}
 	if err := repo.EnsureRepo(); err != nil {
 		return err
 	}
@@ -104,10 +104,23 @@ func run(ctx context.Context, o options) error {
 	if err != nil {
 		return err
 	}
-	if err := stageChanges(repo, o); err != nil {
+
+	specs := buildSpecs(o)
+	names := make([]string, len(specs))
+	for i, s := range specs {
+		names[i] = s.Name
+	}
+	// Full screen only when there is something to babysit; --all-stages
+	// prints a one-off tree instead.
+	d := tui.New(os.Stdout, !o.allStages && len(specs) > 0, fmt.Sprintf("babysit  %s  (%s)", project, branch), names...)
+	defer d.Close()
+	gitOut := d.Writer("")
+	repo.Stdout, repo.Stderr = gitOut, gitOut
+	logf := func(format string, args ...any) { d.Log("", fmt.Sprintf(format, args...)) }
+
+	if err := stageChanges(repo, o, logf); err != nil {
 		return err
 	}
-
 	if err := repo.Commit(o.message); err != nil {
 		return err
 	}
@@ -118,6 +131,7 @@ func run(ctx context.Context, o options) error {
 	if err != nil {
 		return err
 	}
+	d.Info("commit", fmt.Sprintf("%s %s", sha[:min(len(sha), 12)], o.message))
 
 	baseURL := host
 	if !strings.Contains(baseURL, "://") {
@@ -127,10 +141,9 @@ func run(ctx context.Context, o options) error {
 	waitCtx, cancel := context.WithTimeout(ctx, o.timeout)
 	defer cancel()
 	color := isTerminal(os.Stdout)
-	short := sha[:min(len(sha), 12)]
 
 	if o.allStages {
-		fmt.Printf("\nWaiting for pipeline(s) for %s on %s/%s...\n", short, host, project)
+		logf("waiting for pipeline(s) on %s/%s...", host, project)
 		pipelines, err := client.WaitForPipelines(waitCtx, project, sha, o.pollInterval)
 		if err != nil {
 			return err
@@ -146,59 +159,55 @@ func run(ctx context.Context, o options) error {
 		return nil
 	}
 
-	matches, err := waitForMain(waitCtx, client, project, sha, o)
+	matches, err := waitForMain(waitCtx, client, project, sha, o, logf)
 	if err != nil {
 		return err
 	}
-	for _, m := range matches {
-		fmt.Printf("\nPushed pipeline #%d (%s): %s\n", m.Root.ID, m.Root.Source, m.Root.WebURL)
-		if len(m.Via) > 0 {
-			fmt.Printf("Stages found via: %s\n", strings.Join(m.Via, " > "))
+	showMain(d, matches[0])
+	if !d.Live() {
+		for _, m := range matches {
+			filtered, _ := gitlab.FilterStages(m.Pipeline, o.stages)
+			fmt.Println()
+			render.Tree(os.Stdout, filtered, color)
 		}
-		filtered, _ := gitlab.FilterStages(m.Pipeline, o.stages)
-		fmt.Println()
-		render.Tree(os.Stdout, filtered, color)
 	}
-
-	specs := buildSpecs(o)
 	if len(specs) == 0 {
 		return nil
 	}
-	start := time.Now()
-	var logMu sync.Mutex
+
 	coord := &babysit.Coordinator{
 		API:        client,
 		Interval:   o.pollInterval,
 		MaxRetries: o.maxRetries,
 		MaxPushes:  o.maxPushes,
 		NewPipeline: func(ctx context.Context) (*gitlab.Pipeline, error) {
-			return pushForNewPipeline(ctx, repo, client, branch, project, o)
+			return pushForNewPipeline(ctx, repo, client, branch, project, o, d)
 		},
-		Log: func(spec, msg string) {
-			logMu.Lock()
-			defer logMu.Unlock()
-			fmt.Printf("  [%s] [%s] %s\n", time.Since(start).Round(time.Second), spec, msg)
-		},
+		Log: d.Log,
 	}
-	names := make([]string, len(specs))
-	for i, s := range specs {
-		names[i] = s.Name
+	if d.Live() {
+		coord.Observe = d.Observe
 	}
-	fmt.Printf("\nBabysitting %s...\n", strings.Join(names, " and "))
 	// Pipelines are newest first; start everything from the newest one.
 	outcomes := coord.Run(ctx, matches[0].Pipeline, specs)
+	d.Close()
 	return report(outcomes)
 }
 
+func showMain(d *tui.Dashboard, m gitlab.StageMatch) {
+	d.Info("main pipeline", fmt.Sprintf("#%s %s", m.Pipeline.IID, m.Pipeline.WebURL))
+	if len(m.Via) > 0 {
+		d.Info("found via", fmt.Sprintf("#%d (%s) > %s", m.Root.ID, m.Root.Source, strings.Join(m.Via, " > ")))
+	}
+}
+
 // waitForMain waits for the main pipeline (the one containing o.stages) for sha.
-func waitForMain(ctx context.Context, client *gitlab.Client, project, sha string, o options) ([]gitlab.StageMatch, error) {
-	fmt.Printf("\nWaiting for stages %q in pipelines for %s in %s (polling every %s)...\n",
-		o.stages, sha[:min(len(sha), 12)], project, o.pollInterval)
-	start := time.Now()
+func waitForMain(ctx context.Context, client *gitlab.Client, project, sha string, o options, logf func(string, ...any)) ([]gitlab.StageMatch, error) {
+	logf("waiting for stages %q in pipelines for %s (polling every %s)...", o.stages, sha[:min(len(sha), 12)], o.pollInterval)
 	last := ""
 	progress := func(msg string) {
-		if msg != last { // only print when something changes
-			fmt.Printf("  [%s] %s\n", time.Since(start).Round(time.Second), msg)
+		if msg != last { // only log when something changes
+			logf("%s", msg)
 			last = msg
 		}
 	}
@@ -233,7 +242,7 @@ func buildSpecs(o options) []babysit.Spec {
 }
 
 // pushForNewPipeline commits a junk change, pushes it and returns the new main pipeline.
-func pushForNewPipeline(ctx context.Context, repo *git.Repo, client *gitlab.Client, branch, project string, o options) (*gitlab.Pipeline, error) {
+func pushForNewPipeline(ctx context.Context, repo *git.Repo, client *gitlab.Client, branch, project string, o options, d *tui.Dashboard) (*gitlab.Pipeline, error) {
 	if cur, err := repo.CurrentBranch(); err != nil || cur != branch {
 		return nil, fmt.Errorf("not pushing a new commit: expected to be on branch %s, now on %q", branch, cur)
 	}
@@ -251,12 +260,15 @@ func pushForNewPipeline(ctx context.Context, repo *git.Repo, client *gitlab.Clie
 	if err != nil {
 		return nil, err
 	}
+	d.Info("commit", fmt.Sprintf("%s %s", sha[:min(len(sha), 12)], o.message))
 	waitCtx, cancel := context.WithTimeout(ctx, o.timeout)
 	defer cancel()
-	matches, err := waitForMain(waitCtx, client, project, sha, o)
+	logf := func(format string, args ...any) { d.Log("", fmt.Sprintf(format, args...)) }
+	matches, err := waitForMain(waitCtx, client, project, sha, o, logf)
 	if err != nil {
 		return nil, err
 	}
+	showMain(d, matches[0])
 	return matches[0].Pipeline, nil
 }
 
@@ -293,7 +305,7 @@ func resolveBase(repo *git.Repo, o options) (string, error) {
 // stageChanges leaves the user's staged changes alone if there are any;
 // otherwise it stages a junk change (a toggled trailing newline) so the push
 // still starts a new pipeline.
-func stageChanges(repo *git.Repo, o options) error {
+func stageChanges(repo *git.Repo, o options, logf func(string, ...any)) error {
 	staged, err := repo.HasStagedChanges()
 	if err != nil || staged {
 		return err
@@ -313,7 +325,7 @@ func stageChanges(repo *git.Repo, o options) error {
 	if added {
 		action = "added"
 	}
-	fmt.Printf("Nothing staged; %s trailing newline in %s to start a new pipeline.\n", action, path)
+	logf("nothing staged; %s trailing newline in %s to start a new pipeline", action, path)
 	return nil
 }
 

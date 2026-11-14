@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -44,6 +45,9 @@ type TestRun struct {
 	Spec       Spec
 	Log        func(string)     // receives one line per event; nil discards
 	Now        func() time.Time // clock for job timeouts; nil means time.Now
+	// Observe receives a Status on every successful poll. When it is set,
+	// the per-poll stage summary goes to it instead of Log.
+	Observe func(Status)
 
 	retries  map[string]int
 	recheck  bool   // poll again after recheckDelay instead of Interval
@@ -101,6 +105,7 @@ func (t *TestRun) Trigger(ctx context.Context, project, iid, jobName string) (*g
 			if !ok {
 				return nil, fmt.Errorf("job %q disappeared from pipeline #%s", jobName, iid)
 			}
+			t.observe(Status{Phase: PhaseTriggering, Trigger: &job})
 			switch {
 			case job.DownstreamRef != nil:
 				return job.DownstreamRef, nil
@@ -157,8 +162,14 @@ func (t *TestRun) Babysit(ctx context.Context, ref gitlab.PipelineRef) (*Result,
 			t.log("transient error, retrying: %v", err)
 		} else {
 			p = snap
-			// Summarize before acting so the actions read as responses to it.
-			if s := summary(p); s != lastSummary {
+			// Report before acting so the actions read as responses to it.
+			if t.Observe != nil {
+				phase := PhaseRunning
+				if res != nil {
+					phase = PhaseCleanup
+				}
+				t.observe(Status{Phase: phase, Pipeline: p, Holding: res == nil})
+			} else if s := summary(p); s != lastSummary {
 				t.log("%s", s)
 				lastSummary = s
 			}
@@ -457,6 +468,15 @@ func (t *TestRun) sleep(ctx context.Context) error {
 	case <-time.After(d):
 		return nil
 	}
+}
+
+func (t *TestRun) observe(s Status) {
+	if t.Observe == nil {
+		return
+	}
+	s.HoldStage = t.Spec.HoldStage
+	s.Retries = maps.Clone(t.retries)
+	t.Observe(s)
 }
 
 func (t *TestRun) log(format string, args ...any) {

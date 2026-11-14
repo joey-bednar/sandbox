@@ -23,6 +23,9 @@ type Coordinator struct {
 	// creates. Calls are serialized.
 	NewPipeline func(ctx context.Context) (*gitlab.Pipeline, error)
 	Log         func(spec, msg string)
+	// Observe, if set, receives every Status change of every Spec,
+	// including a final PhasePassed or PhaseFailed.
+	Observe func(spec string, s Status)
 
 	pushMu sync.Mutex
 }
@@ -55,12 +58,30 @@ func (c *Coordinator) Run(ctx context.Context, main *gitlab.Pipeline, specs []Sp
 	return out
 }
 
-func (c *Coordinator) runOne(ctx context.Context, main *gitlab.Pipeline, spec Spec) Outcome {
-	o := Outcome{Spec: spec, Main: main}
+func (c *Coordinator) runOne(ctx context.Context, main *gitlab.Pipeline, spec Spec) (o Outcome) {
+	o = Outcome{Spec: spec, Main: main}
+	var last Status
+	emit := func(s Status) {
+		s.Main, s.Pushes = main, o.Pushes
+		last = s
+		c.observe(spec.Name, s)
+	}
+	defer func() {
+		last.Phase, last.Err = PhasePassed, o.Err
+		if o.Err != nil {
+			last.Phase = PhaseFailed
+		}
+		last.Holding = false
+		emit(last)
+	}()
 	tr := &TestRun{
 		API: c.API, Interval: c.Interval, MaxRetries: c.MaxRetries, Spec: spec,
 		Log: func(msg string) { c.log(spec.Name, msg) },
 	}
+	if c.Observe != nil {
+		tr.Observe = emit
+	}
+	emit(Status{Phase: PhaseTriggering, HoldStage: spec.HoldStage})
 	for {
 		job, err := FindJob(main, spec.TriggerStages, spec.MatchJob)
 		if err != nil {
@@ -92,6 +113,7 @@ func (c *Coordinator) runOne(ctx context.Context, main *gitlab.Pipeline, spec Sp
 			return o
 		}
 		c.log(spec.Name, "pushing a new commit to start a fresh pipeline")
+		emit(Status{Phase: PhasePushing, Pipeline: res.Pipeline, HoldStage: spec.HoldStage, Retries: last.Retries})
 		if main, err = c.newPipeline(ctx); err != nil {
 			o.Err = err
 			return o
@@ -106,6 +128,12 @@ func (c *Coordinator) newPipeline(ctx context.Context) (*gitlab.Pipeline, error)
 	c.pushMu.Lock()
 	defer c.pushMu.Unlock()
 	return c.NewPipeline(ctx)
+}
+
+func (c *Coordinator) observe(spec string, s Status) {
+	if c.Observe != nil {
+		c.Observe(spec, s)
+	}
 }
 
 func (c *Coordinator) log(spec, msg string) {

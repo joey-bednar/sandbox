@@ -432,3 +432,45 @@ func TestBabysitRestartsOverdueTestCases(t *testing.T) {
 		t.Errorf("calls = %v, want %v", api.calls, want)
 	}
 }
+
+func TestCoordinatorObservesEveryPhase(t *testing.T) {
+	main := pipeline("1", stage("Deploy and Test", gitlab.Job{ID: "t", Name: "helm-charts", Status: "manual"}))
+	triggered := pipeline("1", stage("Deploy and Test", gitlab.Job{ID: "t", Name: "helm-charts", Status: "success",
+		DownstreamRef: &gitlab.PipelineRef{Project: "g/h", IID: "7"}}))
+	api := newFake(map[string][]*gitlab.Pipeline{
+		"1": {main, triggered},
+		"7": {
+			helm("7", "running", job("pc", "created")),
+			helm("7", "success", job("pc", "canceled")),
+			helm("7", "success", job("pc", "success")),
+		},
+	})
+	var mu sync.Mutex
+	var phases []Phase
+	var holding []bool
+	c := &Coordinator{API: api, Interval: time.Millisecond, Observe: func(spec string, s Status) {
+		mu.Lock()
+		defer mu.Unlock()
+		if spec != "helm-charts" {
+			t.Errorf("spec = %q", spec)
+		}
+		if len(phases) == 0 || phases[len(phases)-1] != s.Phase {
+			phases = append(phases, s.Phase)
+			holding = append(holding, s.Holding)
+		}
+		if s.Main == nil {
+			t.Error("status without main pipeline")
+		}
+	}}
+	out := c.Run(context.Background(), main, []Spec{helmSpec})
+	if out[0].Err != nil {
+		t.Fatal(out[0].Err)
+	}
+	want := []Phase{PhaseTriggering, PhaseRunning, PhaseCleanup, PhasePassed}
+	if !slices.Equal(phases, want) {
+		t.Errorf("phases = %v, want %v", phases, want)
+	}
+	if !slices.Equal(holding, []bool{false, true, false, false}) {
+		t.Errorf("holding = %v", holding)
+	}
+}

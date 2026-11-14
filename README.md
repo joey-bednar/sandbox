@@ -39,6 +39,20 @@ Host and project are derived from the `origin` remote. Override as needed:
 | `--max-retries` | `0` | Give up after a job fails this many times (0 = retry forever) |
 | `--max-pushes` | `5` | For helm-charts: give up after pushing this many new commits (0 = unlimited) |
 
+## Display
+
+In a terminal, babysit takes over the screen with a live dashboard that is redrawn whenever any pipeline changes (and when the terminal is resized). At the top are the commit, the main pipeline and the git/setup log. Below that there is one section each for automated-testing and helm-charts. Each section shows its phase and pipeline link, every job grouped by stage, and its last few log lines. Job names are colored by state:
+
+| Color | Meaning | GitLab statuses |
+| --- | --- | --- |
+| blue | running | running, pending, preparing, waiting_for_resource |
+| green | passed | success |
+| red | failed | failed, canceled (babysit will retry it) |
+| yellow | paused | manual, scheduled, or held back by babysit (Clean Up / Post Clean Up) |
+| grey | not triggered yet | created, skipped, or a trigger job that hasn't been played |
+
+`↻N` after a job name means babysit has retried it N times. When babysit exits (including on Ctrl-C), the screen is restored and the final dashboard is printed with the results below it, so it stays in your scrollback. When output isn't a terminal (piped or redirected), babysit prints plain log lines instead.
+
 ## Junk changes
 
 If nothing is staged, babysit picks the first file (alphabetically) that changed on this branch since it split from `--base`. It skips files with uncommitted edits and binary files. It then toggles that file's trailing newline: it removes the newline if one is there, and adds one otherwise. It stages that change and commits it. Running it again flips the newline back, so these commits never pile up into a real diff.
