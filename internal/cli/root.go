@@ -23,6 +23,9 @@ import (
 
 const tokenEnv = "GITLAB_API_KEY"
 
+// version is babysit's release version, shown by --version.
+const version = "v0.1.0"
+
 // options holds babysit's settings. They are fixed; only the debug ones
 // (hidden flags, for testing against a fake GitLab) can be changed.
 type options struct {
@@ -88,14 +91,16 @@ func Execute() {
 func newRootCmd() *cobra.Command {
 	o := defaultOptions()
 	cmd := &cobra.Command{
-		Use:   "babysit",
-		Short: "Automates the process of getting passing pipelines for your changes.",
-		Args:  cobra.NoArgs,
+		Use:     "babysit",
+		Short:   "Automates the process of getting passing pipelines for your changes.",
+		Args:    cobra.NoArgs,
+		Version: version,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cmd.SilenceUsage = true
 			return run(cmd.Context(), o)
 		},
 	}
+	cmd.SetVersionTemplate("babysit {{.Version}}\n")
 	f := cmd.Flags()
 	f.BoolVar(&o.upgrade, "upgrade", false, "run the helm-charts upgrade")
 	f.BoolVar(&o.onlyTests, "automated-testing", false, "only get a passing automated-testing pipeline (alias: --automated-tests)")

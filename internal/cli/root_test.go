@@ -74,3 +74,16 @@ func TestNoneConflicts(t *testing.T) {
 		}
 	}
 }
+
+func TestVersion(t *testing.T) {
+	cmd := newRootCmd()
+	var out strings.Builder
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--version"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "babysit v0.1.0\n" {
+		t.Errorf("version output = %q", out.String())
+	}
+}

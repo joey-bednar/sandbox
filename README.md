@@ -30,6 +30,7 @@ Options:
 | `--automated-testing` | `--automated-tests` | Only trigger and babysit automated-testing; helm-charts is never triggered |
 | `--helm-charts` | `--helm`, `--helm-chart` | Only trigger and babysit helm-charts; automated-testing is never triggered |
 | `--upgrade` | | Run the helm-charts upgrade (below) |
+| `--version` | `-v` | Print the version (`babysit v0.1.0`) and exit |
 | `--none` | | Trigger neither automated-testing nor helm-charts; only babysit the pipelines that run from "Monorepo Triggers" |
 
 With neither (or both) of `--automated-testing` and `--helm-charts`, babysit does both. `--none` can't be combined with them or with `--upgrade`. It still commits, pushes and waits for the main pipeline as usual. `--upgrade` together with only `--automated-testing` is an error, since helm-charts wouldn't run.
