@@ -2,7 +2,7 @@
 
 A CLI for babysitting flaky GitLab CI pipelines.
 
-Current scope: commit and push the staged changes, then poll GitLab until the wanted stages (by default "Monorepo Triggers" and "Deploy and Test") appear somewhere in the commit's pipeline tree. Those stages usually live in a downstream pipeline (Generate Root Pipeline > Create Main Pipeline) that only exists after the root pipeline's trigger job runs. babysit then prints those stages' jobs, marking manual jobs and trigger jobs. If the root pipeline finishes without ever creating the stages, babysit stops with an error that lists the stages it did see.
+Current scope: commit and push the staged changes (or, if nothing is staged, a junk change to start a fresh pipeline), then poll GitLab until the wanted stages (by default "Monorepo Triggers" and "Deploy and Test") appear somewhere in the commit's pipeline tree. Those stages usually live in a downstream pipeline (Generate Root Pipeline > Create Main Pipeline) that only exists after the root pipeline's trigger job runs. babysit then prints those stages' jobs, marking manual jobs and trigger jobs. If the root pipeline finishes without ever creating the stages, babysit stops with an error that lists the stages it did see.
 
 ## Usage
 
@@ -12,7 +12,8 @@ Run it from the repo you want to babysit, pointing `go run -C` at this checkout:
 export GITLAB_API_KEY=glpat-...   # needs the api scope (babysit plays, retries and cancels jobs)
 cd ~/work/your-gitlab-repo
 git add -p
-go run -C ~/sandbox . -m "Fix the thing"
+go run -C ~/sandbox . -m "Fix the thing"   # commits what you staged
+go run -C ~/sandbox .                      # nothing staged: junk change, "Get passing pipelines"
 ```
 
 `-C` makes Go build from this checkout, and babysit runs git in the directory you
@@ -23,7 +24,8 @@ Host and project are derived from the `origin` remote. Override as needed:
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `-m, --message` | (required) | Commit message |
+| `-m, --message` | `Get passing pipelines` | Commit message |
+| `--base` | remote's default branch | Base branch for finding files changed on this branch (used for junk changes) |
 | `--remote` | `origin` | Remote to push to and derive the project from |
 | `--host` | from remote | GitLab host or base URL (`https://` assumed) |
 | `--project` | from remote | Project path, e.g. `group/sub/project` |
@@ -33,6 +35,10 @@ Host and project are derived from the `origin` remote. Override as needed:
 | `--all-stages` | `false` | Skip the stage search and show the full pushed pipeline(s) |
 | `--test-job-suffix` | `-automated-testing` | Trigger and babysit the job ending in this suffix; empty disables |
 | `--max-retries` | `0` | Give up after a job fails this many times (0 = retry forever) |
+
+## Junk changes
+
+If nothing is staged, babysit picks the first file (alphabetically) that changed on this branch since it split from `--base`. It skips files with uncommitted edits and binary files. It then toggles that file's trailing newline: it removes the newline if one is there, and adds one otherwise. It stages that change and commits it. Running it again flips the newline back, so these commits never pile up into a real diff.
 
 ## Test babysitting
 

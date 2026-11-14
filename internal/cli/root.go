@@ -32,7 +32,10 @@ type options struct {
 	allStages    bool
 	testSuffix   string
 	maxRetries   int
+	base         string
 }
+
+const defaultMessage = "Get passing pipelines"
 
 // defaultStages are the stages whose jobs babysit cares about triggering/rerunning.
 var defaultStages = []string{"Monorepo Triggers", "Deploy and Test"}
@@ -57,8 +60,8 @@ func Execute() {
 func newRootCmd() *cobra.Command {
 	var o options
 	cmd := &cobra.Command{
-		Use:   "babysit -m <message>",
-		Short: "Commit and push staged changes, then show the resulting GitLab pipeline(s)",
+		Use:   "babysit [-m <message>]",
+		Short: "Commit and push (staged changes, or a junk change if nothing is staged), then babysit the GitLab pipelines",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cmd.SilenceUsage = true
@@ -66,7 +69,8 @@ func newRootCmd() *cobra.Command {
 		},
 	}
 	f := cmd.Flags()
-	f.StringVarP(&o.message, "message", "m", "", "commit message (required)")
+	f.StringVarP(&o.message, "message", "m", defaultMessage, "commit message")
+	f.StringVar(&o.base, "base", "", "base branch for finding files changed on this branch (default: the remote's default branch)")
 	f.StringVar(&o.remote, "remote", "origin", "git remote to push to")
 	f.StringVar(&o.host, "host", "", "GitLab host or base URL (default: derived from the remote URL, https assumed)")
 	f.StringVar(&o.project, "project", "", "GitLab project path, e.g. group/project (default: derived from the remote URL)")
@@ -76,7 +80,6 @@ func newRootCmd() *cobra.Command {
 	f.BoolVar(&o.allStages, "all-stages", false, "skip the stage search and show the full pushed pipeline(s)")
 	f.StringVar(&o.testSuffix, "test-job-suffix", "-automated-testing", "trigger and babysit the job with this name suffix; empty disables")
 	f.IntVar(&o.maxRetries, "max-retries", 0, "give up after a job fails this many times (0 = retry forever)")
-	_ = cmd.MarkFlagRequired("message")
 	return cmd
 }
 
@@ -93,19 +96,15 @@ func run(ctx context.Context, o options) error {
 	if err := repo.EnsureRepo(); err != nil {
 		return err
 	}
-	staged, err := repo.HasStagedChanges()
-	if err != nil {
-		return err
-	}
-	if !staged {
-		return errors.New("no staged changes to commit")
-	}
 	branch, err := repo.CurrentBranch()
 	if err != nil {
 		return err
 	}
 	host, project, err := resolveProject(repo, o)
 	if err != nil {
+		return err
+	}
+	if err := stageChanges(repo, o); err != nil {
 		return err
 	}
 
@@ -212,6 +211,35 @@ func runTests(ctx context.Context, client *gitlab.Client, m gitlab.StageMatch, o
 	}
 
 	fmt.Printf("\nDone. Pipelines for your MR:\n  main:  %s\n  tests: %s\n", m.Pipeline.WebURL, tp.WebURL)
+	return nil
+}
+
+// stageChanges leaves the user's staged changes alone if there are any;
+// otherwise it stages a junk change (a toggled trailing newline) so the push
+// still starts a new pipeline.
+func stageChanges(repo *git.Repo, o options) error {
+	staged, err := repo.HasStagedChanges()
+	if err != nil || staged {
+		return err
+	}
+	base := o.base
+	if base == "" {
+		if base, err = repo.DefaultBase(o.remote); err != nil {
+			return err
+		}
+	}
+	path, added, err := repo.StageJunkChange(base)
+	if err != nil {
+		return fmt.Errorf("nothing staged, and no file to make a junk change to: %w", err)
+	}
+	if rel, err := filepath.Rel(repo.Dir, path); err == nil && repo.Dir != "" {
+		path = rel
+	}
+	action := "removed"
+	if added {
+		action = "added"
+	}
+	fmt.Printf("Nothing staged; %s trailing newline in %s to start a new pipeline.\n", action, path)
 	return nil
 }
 
