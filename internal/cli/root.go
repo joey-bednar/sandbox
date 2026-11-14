@@ -38,6 +38,7 @@ type options struct {
 	testTimeout  time.Duration
 	helmJob      string
 	maxPushes    int
+	maxRun       time.Duration
 	upgrade      bool // play helm-charts' Setup job containing "upgrade"
 	onlyTests    bool // babysit only automated-testing
 	onlyHelm     bool // babysit only helm-charts
@@ -52,10 +53,13 @@ func defaultOptions() options {
 		// Stages of the main pipeline holding the trigger jobs.
 		stages:      []string{"Monorepo Triggers", "Deploy and Test"},
 		testSuffix:  "-automated-testing",
-		maxRetries:  0, // retry forever
+		maxRetries:  5, // per job, per pipeline
 		testTimeout: 20 * time.Minute,
 		helmJob:     "helm-charts",
 		maxPushes:   5,
+		// Hard limit on a whole run, so babysit can't go on forever
+		// unattended (e.g. waiting on a job that never starts).
+		maxRun: 8 * time.Hour,
 	}
 }
 
@@ -110,6 +114,8 @@ func run(ctx context.Context, o options) error {
 	if o.upgrade && o.onlyTests && !o.onlyHelm {
 		return errors.New("--upgrade runs the helm-charts upgrade, but --automated-testing skips helm-charts")
 	}
+	ctx, cancel := context.WithTimeoutCause(ctx, o.maxRun, fmt.Errorf("gave up after the %s limit for a run", o.maxRun))
+	defer cancel()
 	token := os.Getenv(tokenEnv)
 	if token == "" {
 		return fmt.Errorf("%s is not set", tokenEnv)

@@ -45,8 +45,9 @@ The GitLab host and project come from the `origin` remote, and these settings ar
 | automated-testing trigger job | ends in `-automated-testing`, in "Monorepo Triggers" or "Deploy and Test" |
 | helm-charts trigger job | `helm-charts`, in "Deploy and Test" |
 | Restart Execute Test Cases jobs running longer than | 20m |
-| Retries per job | unlimited |
+| Retries per job | at most 5 per job, per pipeline (the 6th failure gives up on that pipeline) |
 | New pushes for helm-charts Deploy failures | at most 5 |
+| Total run time | 8h, then babysit gives up on whatever is still running |
 
 For testing against a fake GitLab there are hidden flags, left out of `--help`: `--debug-host`, `--debug-project` and `--debug-poll-interval`.
 
@@ -112,7 +113,7 @@ Watched Monorepo Triggers pipelines follow, under their trigger job's name. A pi
 
 **GitLab 5xx errors on play/retry/cancel** don't stop babysit. GitLab sometimes applies the action and still answers 500, so babysit doesn't resend blindly. It re-reads the job's status 2s later and only acts again if the action didn't take effect. Error messages include GitLab's request ID, which an admin can look up in the server logs.
 
-If you stop babysit (Ctrl-C) mid-run, held jobs it canceled stay canceled. It prints the pipeline link so you can retry them by hand.
+These caps mean babysit always stops on its own, even if you're away. Whenever it gives up on a pipeline before releasing its held stage (too many retries, the 8h limit, Ctrl-C, or a GitLab error), it releases Clean Up / Post Clean Up on the way out so the environment still gets torn down. It doesn't wait for that clean-up to finish. If the release itself fails, the error says so and links the pipeline so you can retry those jobs by hand.
 
 ## Development
 

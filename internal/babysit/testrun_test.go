@@ -164,10 +164,50 @@ func TestBabysitMissingHoldStage(t *testing.T) {
 	}
 }
 
-func TestBabysitInterruptedMentionsHeldStage(t *testing.T) {
+func TestBabysitReleasesHeldStageWhenInterrupted(t *testing.T) {
+	api := newFake(map[string][]*gitlab.Pipeline{"9": {
+		tests("9", []gitlab.Job{job("s1", "running")}, nil, []gitlab.Job{job("c1", "created")}),
+		tests("9", []gitlab.Job{job("s1", "running")}, nil, []gitlab.Job{job("c1", "canceled")}),
+	}})
+	limit := errors.New("gave up after the limit")
+	ctx, cancel := context.WithTimeoutCause(context.Background(), 20*time.Millisecond, limit)
+	defer cancel()
+	_, err := newRun(api, testsSpec).Babysit(ctx, gitlab.PipelineRef{IID: "9"})
+	if !errors.Is(err, limit) {
+		t.Fatalf("err = %v", err)
+	}
+	// Held while running, then released on the way out.
+	if want := []string{"cancel:c1", "retry:c1"}; !slices.Equal(api.calls, want) {
+		t.Errorf("calls = %v, want %v", api.calls, want)
+	}
+}
+
+func TestBabysitReleasesHeldStageAfterTooManyRetries(t *testing.T) {
+	api := newFake(map[string][]*gitlab.Pipeline{"9": {
+		tests("9", []gitlab.Job{job("s1", "failed")}, nil, []gitlab.Job{job("c1", "canceled")}),
+	}})
+	run := newRun(api, testsSpec)
+	run.MaxRetries = 5
+	_, err := run.Babysit(context.Background(), gitlab.PipelineRef{IID: "9"})
+	if !errors.Is(err, ErrTooManyRetries) {
+		t.Fatalf("err = %v", err)
+	}
+	retries := 0
+	for _, c := range api.calls {
+		if c == "retry:s1" {
+			retries++
+		}
+	}
+	if retries != 5 || api.calls[len(api.calls)-1] != "retry:c1" {
+		t.Errorf("calls = %v, want 5 retries of s1 then retry:c1", api.calls)
+	}
+}
+
+func TestBabysitReportsWhenReleaseFails(t *testing.T) {
 	api := newFake(map[string][]*gitlab.Pipeline{"9": {
 		tests("9", []gitlab.Job{job("s1", "running")}, nil, []gitlab.Job{job("c1", "canceled")}),
 	}})
+	api.errs = map[string][]error{"retry:c1": {errors.New("forbidden")}}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	_, err := newRun(api, testsSpec).Babysit(ctx, gitlab.PipelineRef{IID: "9"})

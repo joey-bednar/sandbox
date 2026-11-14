@@ -150,11 +150,45 @@ var holdable = []string{"created", "waiting_for_resource", "preparing", "pending
 //
 // A failure in a NoRetryStages stage still goes through release and clean-up,
 // so the environment is torn down, and returns Result.Passed == false.
+//
+// If it gives up before releasing (too many retries, the time limit, Ctrl-C,
+// a GitLab error), it releases HoldStage on the way out so the environment
+// still gets torn down.
 func (t *TestRun) Babysit(ctx context.Context, ref gitlab.PipelineRef) (*Result, error) {
+	released := false
+	res, err := t.babysit(ctx, ref, &released)
+	if err != nil && !released {
+		err = t.releaseOnExit(ctx, ref, err)
+	}
+	return res, err
+}
+
+// releaseTimeout bounds releasing held jobs when giving up.
+const releaseTimeout = time.Minute
+
+// releaseOnExit releases the held stage after babysit gave up with cause.
+// ctx may already be done, so it uses a fresh deadline.
+func (t *TestRun) releaseOnExit(ctx context.Context, ref gitlab.PipelineRef, cause error) error {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+	defer cancel()
+	p, err := t.API.GetPipeline(rctx, ref.Project, ref.IID, 0)
+	if err == nil {
+		var hold *gitlab.Stage
+		if hold, _, err = t.split(p); err != nil {
+			return cause // no held stage, so nothing to release
+		}
+		if err = t.release(rctx, hold); err == nil {
+			return cause
+		}
+	}
+	return fmt.Errorf("%w; releasing %s failed (%v), so jobs babysit canceled there are still canceled: retry them from %s",
+		cause, t.Spec.HoldStage, err, pipelineURL(p, ref))
+}
+
+func (t *TestRun) babysit(ctx context.Context, ref gitlab.PipelineRef, released *bool) (*Result, error) {
 	t.retries = map[string]int{}
 	var (
 		res         *Result // non-nil once the outcome is decided
-		released    bool
 		lastSummary string
 		p           *gitlab.Pipeline
 	)
@@ -194,9 +228,9 @@ func (t *TestRun) Babysit(ctx context.Context, ref gitlab.PipelineRef) (*Result,
 					if err := t.release(ctx, hold); err != nil {
 						return nil, err
 					}
-					released = true
+					*released = true
 				}
-			case released:
+			case *released:
 				done, err := t.cleanup(ctx, hold)
 				if err != nil {
 					return nil, err
@@ -208,10 +242,6 @@ func (t *TestRun) Babysit(ctx context.Context, ref gitlab.PipelineRef) (*Result,
 			}
 		}
 		if err := t.sleep(ctx); err != nil {
-			if !released {
-				err = fmt.Errorf("%w; any %q jobs babysit canceled are still canceled, retry them from %s",
-					err, t.Spec.HoldStage, pipelineURL(p, ref))
-			}
 			return nil, err
 		}
 	}
@@ -511,7 +541,7 @@ func (t *TestRun) sleep(ctx context.Context) error {
 	}
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return context.Cause(ctx) // e.g. the run time limit, not just "deadline exceeded"
 	case <-time.After(d):
 		return nil
 	}
