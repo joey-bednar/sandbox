@@ -49,15 +49,19 @@ func (t *TestRun) watch(ctx context.Context, ref gitlab.PipelineRef) (*gitlab.Pi
 		} else {
 			p = snap
 			t.observe(Status{Phase: PhaseRunning, Pipeline: p})
+			if err := t.restartStuck(ctx, p.Project, p.Stages); err != nil {
+				return p, err
+			}
 			passed, active := true, false
 			var stuck []string
 			for _, s := range p.Stages {
 				for _, j := range s.Jobs {
 					switch {
-					case j.Status == "failed":
+					case j.Status == "failed", j.Status == "canceled" && t.restarting[j.ID]:
 						if err := t.retry(ctx, j, s.Name); err != nil {
 							return p, err
 						}
+						delete(t.restarting, j.ID)
 						active = true
 					case slices.Contains(activeStatuses, j.Status):
 						active = true

@@ -15,11 +15,13 @@ import (
 // fakeAPI serves successive snapshots per pipeline IID (repeating the last
 // one) and records every mutation as "play:<id>", "retry:<id>" or "cancel:<id>".
 type fakeAPI struct {
-	mu        sync.Mutex
-	snapshots map[string][]*gitlab.Pipeline
-	polls     map[string]int
-	calls     []string
-	errs      map[string][]error // per call, consumed in order; the call is still recorded
+	mu         sync.Mutex
+	snapshots  map[string][]*gitlab.Pipeline
+	polls      map[string]int
+	calls      []string
+	errs       map[string][]error // per call, consumed in order; the call is still recorded
+	traces     map[string]string  // job log by job ID
+	traceReads int
 }
 
 func newFake(snaps map[string][]*gitlab.Pipeline) *fakeAPI {
@@ -47,6 +49,12 @@ func (f *fakeAPI) record(c string) error {
 func (f *fakeAPI) PlayJob(_ context.Context, id string) error   { return f.record("play:" + id) }
 func (f *fakeAPI) RetryJob(_ context.Context, id string) error  { return f.record("retry:" + id) }
 func (f *fakeAPI) CancelJob(_ context.Context, id string) error { return f.record("cancel:" + id) }
+func (f *fakeAPI) JobTrace(_ context.Context, _, id string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.traceReads++
+	return f.traces[id], nil
+}
 
 func job(id, status string) gitlab.Job { return gitlab.Job{ID: id, Name: id, Status: status} }
 
@@ -716,6 +724,96 @@ func TestWatchCtrlCCancelsActiveJobs(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 	if want := []string{"cancel:b", "cancel:u"}; !slices.Equal(api.calls, want) {
+		t.Errorf("calls = %v, want %v", api.calls, want)
+	}
+}
+
+const dockerStuck = "Pulling image...\n\x1b[0;33mWaiting for docker daemon to start...\x1b[0;m\n"
+
+func runningFor(id string, now time.Time, d time.Duration) gitlab.Job {
+	j := job(id, "running")
+	j.StartedAt = now.Add(-d)
+	return j
+}
+
+func TestBabysitRestartsJobsStuckWaitingForDocker(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	api := newFake(map[string][]*gitlab.Pipeline{"9": {
+		tests("9", []gitlab.Job{job("s", "success")},
+			[]gitlab.Job{
+				runningFor("stuck", now, 6*time.Minute),  // stuck: restart
+				runningFor("busy", now, 6*time.Minute),   // log moving on: leave it
+				runningFor("young", now, 4*time.Minute),  // under 5m: don't even look
+				runningFor("waited", now, 6*time.Minute), // phrase earlier, not last line
+			},
+			[]gitlab.Job{job("c", "canceled")}),
+		tests("9", []gitlab.Job{job("s", "success")},
+			[]gitlab.Job{job("stuck", "canceled"), runningFor("busy", now, 6*time.Minute), job("young", "success"), job("waited", "success")},
+			[]gitlab.Job{job("c", "canceled")}),
+		tests("9", []gitlab.Job{job("s", "success")},
+			[]gitlab.Job{job("stuck2", "success"), job("busy", "success"), job("young", "success"), job("waited", "success")},
+			[]gitlab.Job{job("c", "canceled")}),
+		tests("9", []gitlab.Job{job("s", "success")},
+			[]gitlab.Job{job("stuck2", "success"), job("busy", "success"), job("young", "success"), job("waited", "success")},
+			[]gitlab.Job{job("c", "success")}),
+	}})
+	api.traces = map[string]string{
+		"stuck":  dockerStuck,
+		"busy":   "Running tests\ntest 41 passed\n",
+		"young":  dockerStuck,
+		"waited": "Waiting for docker daemon to start...\nDocker is up\nRunning tests\n",
+	}
+	run := newRun(api, testsSpec)
+	run.Now = func() time.Time { return now }
+	res, err := run.Babysit(context.Background(), gitlab.PipelineRef{IID: "9"})
+	if err != nil || !res.Passed {
+		t.Fatalf("res = %+v, err = %v", res, err)
+	}
+	want := []string{"cancel:stuck", "retry:stuck", "retry:c"}
+	if !slices.Equal(api.calls, want) {
+		t.Errorf("calls = %v, want %v", api.calls, want)
+	}
+	// stuck, busy and waited once each: busy is still running on the second
+	// poll, but the clock hasn't moved, so its log isn't read again.
+	if api.traceReads != 3 {
+		t.Errorf("trace reads = %d, want 3", api.traceReads)
+	}
+}
+
+func TestWatchRestartsStuckJob(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	api := newFake(map[string][]*gitlab.Pipeline{"8": {
+		pipeline("8", stage("build", runningFor("b", now, 10*time.Minute))),
+		pipeline("8", stage("build", job("b", "canceled"))),
+		pipeline("8", stage("build", job("b2", "success"))),
+	}})
+	api.traces = map[string]string{"b": dockerStuck}
+	run := newRun(api, Spec{Name: "lib"})
+	run.Now = func() time.Time { return now }
+	if _, err := run.Watch(context.Background(), gitlab.PipelineRef{IID: "8"}); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"cancel:b", "retry:b"}; !slices.Equal(api.calls, want) {
+		t.Errorf("calls = %v, want %v", api.calls, want)
+	}
+}
+
+func TestBabysitRestartsStuckCleanupJob(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	done := []gitlab.Job{job("s", "success")}
+	api := newFake(map[string][]*gitlab.Pipeline{"9": {
+		tests("9", done, done, []gitlab.Job{job("c", "canceled")}),
+		tests("9", done, done, []gitlab.Job{runningFor("c", now, 7*time.Minute)}),
+		tests("9", done, done, []gitlab.Job{job("c", "canceled")}),
+		tests("9", done, done, []gitlab.Job{job("c2", "success")}),
+	}})
+	api.traces = map[string]string{"c": dockerStuck}
+	run := newRun(api, testsSpec)
+	run.Now = func() time.Time { return now }
+	if _, err := run.Babysit(context.Background(), gitlab.PipelineRef{IID: "9"}); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"retry:c", "cancel:c", "retry:c"}; !slices.Equal(api.calls, want) {
 		t.Errorf("calls = %v, want %v", api.calls, want)
 	}
 }

@@ -21,6 +21,7 @@ type API interface {
 	PlayJob(ctx context.Context, id string) error
 	RetryJob(ctx context.Context, id string) error
 	CancelJob(ctx context.Context, id string) error
+	JobTrace(ctx context.Context, project, id string) (string, error)
 }
 
 // Spec describes one kind of triggered pipeline to babysit.
@@ -57,6 +58,9 @@ type TestRun struct {
 	retries  map[string]int
 	recheck  bool   // poll again after recheckDelay instead of Interval
 	lastWait string // last "waiting on manual job" message, to avoid repeating it
+
+	restarting   map[string]bool      // job IDs babysit canceled in order to retry them
+	traceChecked map[string]time.Time // when each running job's log was last read
 }
 
 // Result is the outcome of Babysit.
@@ -280,6 +284,11 @@ func (t *TestRun) babysit(ctx context.Context, ref gitlab.PipelineRef, released 
 					*released = true
 				}
 			case *released:
+				// Released clean-up jobs can get stuck too; cleanup()
+				// retries the ones restartStuck cancels.
+				if err := t.restartStuck(ctx, p.Project, []gitlab.Stage{*hold}); err != nil {
+					return nil, err
+				}
 				done, err := t.cleanup(ctx, hold)
 				if err != nil {
 					return nil, err
@@ -357,6 +366,9 @@ func (t *TestRun) running(ctx context.Context, p *gitlab.Pipeline, hold *gitlab.
 	if err := t.cancelOverdue(ctx, rest); err != nil {
 		return nil, err
 	}
+	if err := t.restartStuck(ctx, p.Project, rest); err != nil {
+		return nil, err
+	}
 	// Canceled jobs are retried too: babysit only cancels held jobs and
 	// overdue ones, so anything else canceled was interrupted (e.g. by
 	// auto-cancel on push).
@@ -379,10 +391,7 @@ func (t *TestRun) cancelOverdue(ctx context.Context, stages []gitlab.Stage) erro
 	if t.Spec.JobTimeout <= 0 {
 		return nil
 	}
-	now := time.Now
-	if t.Now != nil {
-		now = t.Now
-	}
+	now := t.now
 	for _, s := range stages {
 		if !slices.ContainsFunc(t.Spec.TimeoutStages, func(n string) bool { return gitlab.SameStage(n, s.Name) }) {
 			continue
@@ -400,12 +409,78 @@ func (t *TestRun) cancelOverdue(ctx context.Context, stages []gitlab.Stage) erro
 				return err
 			}
 			if ok {
+				t.markRestarting(j.ID)
 				t.log("%s job %s has run for %s (limit %s); canceled, will restart %s",
 					s.Name, j.Name, ran.Round(time.Second), t.Spec.JobTimeout, j.WebURL)
 			}
 		}
 	}
 	return nil
+}
+
+// Stuck jobs: a job running longer than stuckAfter whose log currently ends
+// in stuckPhrase is waiting on a Docker daemon that won't come up, so it is
+// canceled and retried. Logs are read at most every traceEvery per job.
+const (
+	stuckAfter  = 5 * time.Minute
+	traceEvery  = time.Minute
+	stuckPhrase = "Waiting for docker daemon"
+)
+
+// restartStuck cancels stuck jobs (see stuckAfter) in stages of a pipeline
+// in project. The callers' usual logic retries them once they show as
+// canceled; Watch, which otherwise leaves canceled jobs alone, checks
+// restarting. Failing to read a log is logged and otherwise ignored.
+func (t *TestRun) restartStuck(ctx context.Context, project string, stages []gitlab.Stage) error {
+	if t.traceChecked == nil {
+		t.traceChecked = map[string]time.Time{}
+	}
+	now := t.now()
+	for _, s := range stages {
+		for _, j := range s.Jobs {
+			if j.Status != "running" || j.Bridge || j.StartedAt.IsZero() || t.restarting[j.ID] {
+				continue
+			}
+			ran := now.Sub(j.StartedAt)
+			if ran < stuckAfter || now.Sub(t.traceChecked[j.ID]) < traceEvery {
+				continue
+			}
+			t.traceChecked[j.ID] = now
+			trace, err := t.API.JobTrace(ctx, project, j.ID)
+			if err != nil {
+				t.log("couldn't read the log of %s job %s: %v", s.Name, j.Name, err)
+				continue
+			}
+			last := gitlab.LastLine(trace)
+			if !strings.Contains(strings.ToLower(last), strings.ToLower(stuckPhrase)) {
+				continue
+			}
+			ok, err := t.mutate("canceling stuck "+j.Name, func() error { return t.API.CancelJob(ctx, j.ID) })
+			if err != nil {
+				return err
+			}
+			if ok {
+				t.markRestarting(j.ID)
+				t.log("%s job %s has been running %s and is stuck at %q; canceled, will restart %s",
+					s.Name, j.Name, ran.Round(time.Second), last, j.WebURL)
+			}
+		}
+	}
+	return nil
+}
+
+func (t *TestRun) markRestarting(id string) {
+	if t.restarting == nil {
+		t.restarting = map[string]bool{}
+	}
+	t.restarting[id] = true
+}
+
+func (t *TestRun) now() time.Time {
+	if t.Now != nil {
+		return t.Now()
+	}
+	return time.Now()
 }
 
 func (t *TestRun) release(ctx context.Context, hold *gitlab.Stage) error {
