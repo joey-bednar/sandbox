@@ -40,8 +40,9 @@ type TestRun struct {
 	Spec       Spec
 	Log        func(string) // receives one line per event; nil discards
 
-	retries map[string]int
-	recheck bool // poll again after recheckDelay instead of Interval
+	retries  map[string]int
+	recheck  bool   // poll again after recheckDelay instead of Interval
+	lastWait string // last "waiting on manual job" message, to avoid repeating it
 }
 
 // Result is the outcome of Babysit.
@@ -196,6 +197,7 @@ func (t *TestRun) Babysit(ctx context.Context, ref gitlab.PipelineRef) (*Result,
 // Result once every non-held stage passed or a no-retry job failed.
 func (t *TestRun) running(ctx context.Context, p *gitlab.Pipeline, hold *gitlab.Stage, rest []gitlab.Stage) (*Result, error) {
 	allPassed := true
+	var blocking []string
 	for _, s := range rest {
 		noRetry := t.noRetry(s.Name)
 		for _, j := range s.Jobs {
@@ -203,8 +205,15 @@ func (t *TestRun) running(ctx context.Context, p *gitlab.Pipeline, hold *gitlab.
 				t.log("%s job %s %s; it can't pass by retrying %s", s.Name, j.Name, j.Status, j.WebURL)
 				return &Result{FailedJob: j.Name}, nil
 			}
-			allPassed = allPassed && j.Status == "success"
+			if j.Status == "manual" && !j.AllowFailure {
+				blocking = append(blocking, j.Name)
+			}
+			allPassed = allPassed && passed(j)
 		}
+	}
+	if msg := fmt.Sprintf("waiting on blocking manual job(s) %q; babysit does not play these, start them in GitLab", blocking); len(blocking) > 0 && msg != t.lastWait {
+		t.log("%s", msg)
+		t.lastWait = msg
 	}
 	if allPassed {
 		t.log("all stages except %s passed", t.Spec.HoldStage)
@@ -313,6 +322,20 @@ func (t *TestRun) retry(ctx context.Context, j gitlab.Job, stage string) error {
 	t.retries[j.Name] = n
 	t.log("retrying %s job %s (%s, retry #%d) %s", stage, j.Name, j.Status, n, j.WebURL)
 	return nil
+}
+
+// passed reports whether j no longer stands in the way of its stage passing,
+// matching how GitLab computes stage status: skipped jobs (e.g. when:
+// on_failure jobs after a success) and optional manual jobs don't block.
+// Failed jobs never count, even if allowed to fail, so they get retried.
+func passed(j gitlab.Job) bool {
+	switch j.Status {
+	case "success", "skipped":
+		return true
+	case "manual":
+		return j.AllowFailure
+	}
+	return false
 }
 
 func summary(p *gitlab.Pipeline) string {

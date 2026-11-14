@@ -56,7 +56,7 @@ Each triggered pipeline goes through the same steps. On every poll:
 
 1. **Hold:** cancel any job in the held stage that is queued or running. This repeats on every poll because GitLab re-queues skipped jobs whenever an earlier job is retried.
 2. **Retry:** retry every failed or canceled job in the other stages. babysit only ever cancels held jobs, so anything else canceled was interrupted, e.g. auto-canceled by a newer push.
-3. **Release:** once every other stage has passed, retry the canceled held jobs so they run.
+3. **Release:** once every other stage has passed, retry the canceled held jobs so they run. "Passed" follows GitLab's UI: a stage passes when its jobs succeeded, were skipped, or are optional manual jobs. If a manual job that GitLab requires someone to play is in the way, babysit says so and waits; it never plays those.
 4. **Clean up:** retry failed held jobs until they all finish. The pipeline then counts as passed.
 
 **helm-charts Deploy failures** can't be fixed by retrying. When one happens, babysit still releases Post Clean Up and waits for it, so the environment is torn down. Then it pushes a junk commit (see above; only that file is committed, so anything you've staged meanwhile is left alone), waits for the new main pipeline, and triggers helm-charts there. This repeats up to `--max-pushes` times. automated-testing is not re-triggered; it keeps going (or stays done) in the pipeline it started in.

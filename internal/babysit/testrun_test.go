@@ -352,3 +352,51 @@ func TestBabysitRetry500IsRechecked(t *testing.T) {
 		t.Errorf("calls = %v", api.calls)
 	}
 }
+
+// Skipped jobs and optional manual jobs count as passed, like in GitLab's UI,
+// so the held stage gets released instead of being held forever.
+func TestBabysitReleasesWithSkippedAndOptionalManualJobs(t *testing.T) {
+	optional := gitlab.Job{ID: "opt", Name: "opt", Status: "manual", AllowFailure: true}
+	p := func(cleanup string) *gitlab.Pipeline {
+		return pipeline("5",
+			stage("Build", job("build", "success")),
+			stage("Deploy", job("deploy", "success"), optional),
+			stage("Verify", job("verify", "success"), job("on-failure-notify", "skipped")),
+			stage("Post Clean Up", job("pc", cleanup)))
+	}
+	api := newFake(map[string][]*gitlab.Pipeline{"5": {p("canceled"), p("running"), p("success")}})
+	res, err := newRun(api, helmSpec).Babysit(context.Background(), gitlab.PipelineRef{IID: "5"})
+	if err != nil || !res.Passed {
+		t.Fatalf("res = %+v, err = %v", res, err)
+	}
+	if !slices.Equal(api.calls, []string{"retry:pc"}) {
+		t.Errorf("calls = %v", api.calls)
+	}
+}
+
+// A manual job that isn't allowed to fail blocks the pipeline: babysit keeps
+// holding clean-up and says what it is waiting on.
+func TestBabysitReportsBlockingManualJob(t *testing.T) {
+	gate := gitlab.Job{ID: "gate", Name: "approve-deploy", Status: "manual"}
+	api := newFake(map[string][]*gitlab.Pipeline{"5": {pipeline("5",
+		stage("Build", job("build", "success")),
+		stage("Deploy", gate),
+		stage("Post Clean Up", job("pc", "created")))}})
+	var logs []string
+	run := newRun(api, helmSpec)
+	run.Log = func(s string) { logs = append(logs, s) }
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := run.Babysit(ctx, gitlab.PipelineRef{IID: "5"}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v", err)
+	}
+	n := 0
+	for _, l := range logs {
+		if strings.Contains(l, `blocking manual job(s) ["approve-deploy"]`) {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("expected the blocking-job message exactly once, got %d in %q", n, logs)
+	}
+}
