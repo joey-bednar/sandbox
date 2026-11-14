@@ -51,3 +51,26 @@ func TestUpgradeNeedsHelm(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestNoneSelectsNoSpecs(t *testing.T) {
+	o := defaultOptions()
+	o.none = true
+	if specs := buildSpecs(o); len(specs) != 0 {
+		t.Fatalf("specs = %v", specs)
+	}
+}
+
+func TestNoneConflicts(t *testing.T) {
+	for _, set := range []func(*options){
+		func(o *options) { o.onlyTests = true },
+		func(o *options) { o.onlyHelm = true },
+		func(o *options) { o.upgrade = true },
+	} {
+		o := defaultOptions()
+		o.none = true
+		set(&o)
+		if err := run(context.Background(), o); err == nil || !strings.Contains(err.Error(), "--none") {
+			t.Errorf("err = %v", err)
+		}
+	}
+}

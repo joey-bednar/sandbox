@@ -86,7 +86,8 @@ func (t *TestRun) watch(ctx context.Context, ref gitlab.PipelineRef) (*gitlab.Pi
 
 // watchDownstream watches the pipelines triggered from WatchStage of main,
 // skipping trigger jobs that specs handle. It keeps looking for newly
-// triggered ones until specsDone is closed, then waits for those it found.
+// triggered ones until specsDone is closed and WatchStage has settled (see
+// scan), then waits for those it found.
 func (c *Coordinator) watchDownstream(ctx context.Context, main *gitlab.Pipeline, specs []Spec, specsDone <-chan struct{}) []Outcome {
 	var (
 		mu      sync.Mutex
@@ -124,38 +125,55 @@ func (c *Coordinator) watchDownstream(ctx context.Context, main *gitlab.Pipeline
 			mu.Unlock()
 		}()
 	}
-	scan := func() {
+	// scan starts watching newly triggered pipelines and reports whether
+	// WatchStage has settled: every trigger job has either created its
+	// pipeline or won't run on its own (manual, skipped, finished without
+	// one), so no more pipelines are coming unless someone plays one.
+	scan := func() (settled bool) {
 		p, err := c.API.GetPipeline(ctx, main.Project, main.IID, 0)
 		if err != nil {
-			if !gitlab.IsTransient(err) {
-				c.log("", fmt.Sprintf("looking for %s pipelines: %v", c.WatchStage, err))
+			if gitlab.IsTransient(err) {
+				return false
 			}
-			return
+			c.log("", fmt.Sprintf("looking for %s pipelines: %v", c.WatchStage, err))
+			return true // won't get better; stop looking
 		}
 		f, _ := gitlab.FilterStages(p, []string{c.WatchStage})
 		mu.Lock()
 		defer mu.Unlock()
+		settled = true
 		for _, s := range f.Stages {
 			for _, j := range s.Jobs {
-				// Only trigger jobs that have run: manual ones not yet played
-				// have no downstream pipeline.
-				if j.DownstreamRef == nil || watched[j.Name] || claimed(j.Name) {
+				if claimed(j.Name) {
 					continue
 				}
-				watched[j.Name] = true
-				start(j)
+				// Only trigger jobs that have run: manual ones not yet played
+				// have no downstream pipeline.
+				if j.DownstreamRef == nil {
+					if !j.Manual && slices.Contains(activeStatuses, j.Status) {
+						settled = false // still starting up
+					}
+					continue
+				}
+				if !watched[j.Name] {
+					watched[j.Name] = true
+					start(j)
+				}
 			}
 		}
+		return settled
 	}
-	scan()
-	for done := false; !done; {
+	settled := scan()
+	for specsFinished := false; !specsFinished || !settled; {
 		select {
 		case <-specsDone:
-			done = true
+			specsFinished = true
+			specsDone = nil // a nil channel never fires again
 		case <-ctx.Done():
-			done = true
+			wg.Wait()
+			return out
 		case <-time.After(c.Interval):
-			scan()
+			settled = scan()
 		}
 	}
 	wg.Wait()

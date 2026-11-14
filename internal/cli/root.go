@@ -42,6 +42,7 @@ type options struct {
 	upgrade      bool // play helm-charts' Setup job containing "upgrade"
 	onlyTests    bool // babysit only automated-testing
 	onlyHelm     bool // babysit only helm-charts
+	none         bool // babysit neither; only the Monorepo Triggers pipelines
 }
 
 func defaultOptions() options {
@@ -99,6 +100,7 @@ func newRootCmd() *cobra.Command {
 	f.BoolVar(&o.upgrade, "upgrade", false, "run the helm-charts upgrade")
 	f.BoolVar(&o.onlyTests, "automated-testing", false, "only get a passing automated-testing pipeline (alias: --automated-tests)")
 	f.BoolVar(&o.onlyHelm, "helm-charts", false, "only get a passing helm-charts pipeline (aliases: --helm, --helm-chart)")
+	f.BoolVar(&o.none, "none", false, `don't run automated-testing or helm-charts; only babysit the pipelines triggered from "Monorepo Triggers"`)
 	f.SetNormalizeFunc(func(_ *pflag.FlagSet, name string) pflag.NormalizedName {
 		if canonical, ok := flagAliases[name]; ok {
 			name = canonical
@@ -122,6 +124,9 @@ var flagAliases = map[string]string{
 }
 
 func run(ctx context.Context, o options) error {
+	if o.none && (o.onlyTests || o.onlyHelm || o.upgrade) {
+		return errors.New("--none can't be combined with --automated-testing, --helm-charts or --upgrade")
+	}
 	if o.upgrade && o.onlyTests && !o.onlyHelm {
 		return errors.New("--upgrade runs the helm-charts upgrade, but --automated-testing skips helm-charts")
 	}
@@ -235,7 +240,8 @@ func waitForMain(ctx context.Context, client *gitlab.Client, project, sha string
 }
 
 // buildSpecs describes the triggered pipelines to babysit: both, unless
-// exactly one of --automated-testing and --helm-charts was given.
+// exactly one of --automated-testing and --helm-charts was given, or none
+// with --none.
 func buildSpecs(o options) []babysit.Spec {
 	tests := babysit.Spec{
 		Name:          strings.TrimPrefix(o.testSuffix, "-"),
@@ -259,6 +265,8 @@ func buildSpecs(o options) []babysit.Spec {
 		helm.PlayJob = func(n string) bool { return strings.Contains(strings.ToLower(n), "upgrade") }
 	}
 	switch {
+	case o.none:
+		return nil
 	case o.onlyTests && !o.onlyHelm:
 		return []babysit.Spec{tests}
 	case o.onlyHelm && !o.onlyTests:
@@ -303,6 +311,10 @@ func pushForNewPipeline(ctx context.Context, repo *git.Repo, client *gitlab.Clie
 // paste into the merge request, and each failure with its reason.
 func report(outcomes []babysit.Outcome) error {
 	fmt.Println()
+	if len(outcomes) == 0 {
+		fmt.Println("No pipelines ran from Monorepo Triggers; nothing to babysit.")
+		return nil
+	}
 	failed := 0
 	for _, o := range outcomes {
 		if o.Err != nil {

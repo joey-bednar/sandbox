@@ -837,3 +837,42 @@ func TestBabysitChecksEachJobLogOnlyOnce(t *testing.T) {
 		t.Errorf("trace reads = %d, want 1", api.traceReads)
 	}
 }
+
+func TestCoordinatorWithoutSpecsWaitsForTriggersToSettle(t *testing.T) {
+	b := func(id, status string, manual bool, iid string) gitlab.Job {
+		j := gitlab.Job{ID: id, Name: id, Status: status, Bridge: true, Manual: manual}
+		if iid != "" {
+			j.DownstreamRef = &gitlab.PipelineRef{Project: "g/" + id, IID: iid}
+		}
+		return j
+	}
+	triggers := func(jobs ...gitlab.Job) *gitlab.Pipeline { return pipeline("1", stage("Monorepo Triggers", jobs...)) }
+	main := triggers(b("lib-a", "pending", false, ""), b("lib-m", "created", true, ""))
+	api := newFake(map[string][]*gitlab.Pipeline{
+		"1": {
+			main,
+			triggers(b("lib-a", "running", false, ""), b("lib-m", "manual", true, "")), // still starting
+			triggers(b("lib-a", "running", false, "20"), b("lib-m", "manual", true, "")),
+		},
+		"20": {pipeline("20", stage("build", job("a1", "running"))), pipeline("20", stage("build", job("a1", "success")))},
+	})
+	c := &Coordinator{API: api, Interval: time.Millisecond, WatchStage: "Monorepo Triggers"}
+	out := c.Run(context.Background(), main, nil)
+	if len(out) != 1 || out[0].Spec.Name != "lib-a" || out[0].Err != nil {
+		t.Fatalf("outcomes = %+v", out)
+	}
+}
+
+func TestCoordinatorWithoutSpecsExitsWhenNothingRuns(t *testing.T) {
+	main := pipeline("1", stage("Monorepo Triggers",
+		gitlab.Job{ID: "m", Name: "m", Status: "manual", Manual: true, Bridge: true},
+		gitlab.Job{ID: "s", Name: "s", Status: "skipped", Bridge: true}))
+	api := newFake(map[string][]*gitlab.Pipeline{"1": {main}})
+	c := &Coordinator{API: api, Interval: time.Millisecond, WatchStage: "Monorepo Triggers"}
+	if out := c.Run(context.Background(), main, nil); len(out) != 0 {
+		t.Fatalf("outcomes = %+v", out)
+	}
+	if api.polls["1"] != 1 {
+		t.Errorf("polls = %d, want 1 (settled on the first look)", api.polls["1"])
+	}
+}
