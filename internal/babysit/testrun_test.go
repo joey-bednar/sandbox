@@ -774,7 +774,7 @@ func TestBabysitRestartsJobsStuckWaitingForDocker(t *testing.T) {
 		t.Errorf("calls = %v, want %v", api.calls, want)
 	}
 	// stuck, busy and waited once each: busy is still running on the second
-	// poll, but the clock hasn't moved, so its log isn't read again.
+	// poll, but its log was already checked.
 	if api.traceReads != 3 {
 		t.Errorf("trace reads = %d, want 3", api.traceReads)
 	}
@@ -815,5 +815,25 @@ func TestBabysitRestartsStuckCleanupJob(t *testing.T) {
 	}
 	if want := []string{"retry:c", "cancel:c", "retry:c"}; !slices.Equal(api.calls, want) {
 		t.Errorf("calls = %v, want %v", api.calls, want)
+	}
+}
+
+func TestBabysitChecksEachJobLogOnlyOnce(t *testing.T) {
+	start := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	busy := runningFor("busy", start, 6*time.Minute)
+	snap := tests("9", []gitlab.Job{job("s", "success")}, []gitlab.Job{busy}, []gitlab.Job{job("c", "canceled")})
+	api := newFake(map[string][]*gitlab.Pipeline{"9": {snap, snap, snap, snap,
+		tests("9", []gitlab.Job{job("s", "success")}, []gitlab.Job{job("busy", "success")}, []gitlab.Job{job("c", "canceled")}),
+		tests("9", []gitlab.Job{job("s", "success")}, []gitlab.Job{job("busy", "success")}, []gitlab.Job{job("c", "success")}),
+	}})
+	api.traces = map[string]string{"busy": "Running tests\n"}
+	run := newRun(api, testsSpec)
+	now := start
+	run.Now = func() time.Time { now = now.Add(time.Hour); return now } // plenty of time between polls
+	if _, err := run.Babysit(context.Background(), gitlab.PipelineRef{IID: "9"}); err != nil {
+		t.Fatal(err)
+	}
+	if api.traceReads != 1 {
+		t.Errorf("trace reads = %d, want 1", api.traceReads)
 	}
 }

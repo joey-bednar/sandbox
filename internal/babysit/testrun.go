@@ -59,8 +59,8 @@ type TestRun struct {
 	recheck  bool   // poll again after recheckDelay instead of Interval
 	lastWait string // last "waiting on manual job" message, to avoid repeating it
 
-	restarting   map[string]bool      // job IDs babysit canceled in order to retry them
-	traceChecked map[string]time.Time // when each running job's log was last read
+	restarting   map[string]bool // job IDs babysit canceled in order to retry them
+	traceChecked map[string]bool // jobs whose log was already checked for stuckPhrase
 }
 
 // Result is the outcome of Babysit.
@@ -418,12 +418,12 @@ func (t *TestRun) cancelOverdue(ctx context.Context, stages []gitlab.Stage) erro
 	return nil
 }
 
-// Stuck jobs: a job running longer than stuckAfter whose log currently ends
-// in stuckPhrase is waiting on a Docker daemon that won't come up, so it is
-// canceled and retried. Logs are read at most every traceEvery per job.
+// Stuck jobs: a job running longer than stuckAfter whose log ends in
+// stuckPhrase is waiting on a Docker daemon that won't come up, so it is
+// canceled and retried. Each job's log is read only once: if it isn't stuck
+// by then, it got past that point. (A retry is a new job, checked afresh.)
 const (
 	stuckAfter  = 5 * time.Minute
-	traceEvery  = time.Minute
 	stuckPhrase = "Waiting for docker daemon"
 )
 
@@ -433,20 +433,23 @@ const (
 // restarting. Failing to read a log is logged and otherwise ignored.
 func (t *TestRun) restartStuck(ctx context.Context, project string, stages []gitlab.Stage) error {
 	if t.traceChecked == nil {
-		t.traceChecked = map[string]time.Time{}
+		t.traceChecked = map[string]bool{}
 	}
 	now := t.now()
 	for _, s := range stages {
 		for _, j := range s.Jobs {
-			if j.Status != "running" || j.Bridge || j.StartedAt.IsZero() || t.restarting[j.ID] {
+			if j.Status != "running" || j.Bridge || j.StartedAt.IsZero() || t.restarting[j.ID] || t.traceChecked[j.ID] {
 				continue
 			}
 			ran := now.Sub(j.StartedAt)
-			if ran < stuckAfter || now.Sub(t.traceChecked[j.ID]) < traceEvery {
+			if ran < stuckAfter {
 				continue
 			}
-			t.traceChecked[j.ID] = now
 			trace, err := t.API.JobTrace(ctx, project, j.ID)
+			if err != nil && gitlab.IsTransient(err) {
+				continue // try again next poll
+			}
+			t.traceChecked[j.ID] = true // checked once; never again for this job
 			if err != nil {
 				t.log("couldn't read the log of %s job %s: %v", s.Name, j.Name, err)
 				continue
