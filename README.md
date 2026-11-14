@@ -71,6 +71,8 @@ Results:
                                triggered from https://gitlab.example.com/g/p/-/pipelines/202 (after 1 new push(es))
 ```
 
+**GitLab 5xx errors on play/retry/cancel** don't stop babysit. GitLab sometimes applies the action and still answers 500, so babysit doesn't resend blindly. It re-reads the job's status 2s later and only acts again if the action didn't take effect. Error messages include GitLab's request ID, which an admin can look up in the server logs.
+
 If you stop babysit (Ctrl-C) mid-run, held jobs it canceled stay canceled. It prints the pipeline link so you can retry them by hand.
 
 ## Development

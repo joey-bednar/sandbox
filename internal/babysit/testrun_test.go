@@ -19,6 +19,7 @@ type fakeAPI struct {
 	snapshots map[string][]*gitlab.Pipeline
 	polls     map[string]int
 	calls     []string
+	errs      map[string][]error // per call, consumed in order; the call is still recorded
 }
 
 func newFake(snaps map[string][]*gitlab.Pipeline) *fakeAPI {
@@ -37,6 +38,10 @@ func (f *fakeAPI) record(c string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, c)
+	if q := f.errs[c]; len(q) > 0 {
+		f.errs[c] = q[1:]
+		return q[0]
+	}
 	return nil
 }
 func (f *fakeAPI) PlayJob(_ context.Context, id string) error   { return f.record("play:" + id) }
@@ -276,5 +281,74 @@ func TestCoordinatorStopsAfterMaxPushes(t *testing.T) {
 	out := c.Run(context.Background(), main1, []Spec{helmSpec})
 	if !errors.Is(out[0].Err, ErrMaxPushes) || out[0].Pushes != 2 {
 		t.Fatalf("outcome = %+v", out[0])
+	}
+}
+
+var err500 = &gitlab.APIError{Method: "POST", URL: "/api/graphql", StatusCode: 500, Body: "Internal Server Error"}
+
+// GitLab applied the play but answered 500: babysit must not fail or play again.
+func TestTriggerPlay500ButApplied(t *testing.T) {
+	ref := &gitlab.PipelineRef{Project: "g/h", IID: "9"}
+	m := func(status string, ds *gitlab.PipelineRef) *gitlab.Pipeline {
+		return mainPipeline("1", bridge("bh", "helm-charts", status, ds))
+	}
+	api := newFake(map[string][]*gitlab.Pipeline{"1": {m("manual", nil), m("running", nil), m("running", ref)}})
+	api.errs = map[string][]error{"play:bh": {err500}}
+	var logs []string
+	run := newRun(api, helmSpec)
+	run.Log = func(s string) { logs = append(logs, s) }
+
+	got, err := run.Trigger(context.Background(), "g/p", "1", "helm-charts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *got != *ref || !slices.Equal(api.calls, []string{"play:bh"}) {
+		t.Errorf("ref = %+v, calls = %v", got, api.calls)
+	}
+	if !slices.ContainsFunc(logs, func(l string) bool { return strings.Contains(l, "rechecking") }) {
+		t.Errorf("expected a recheck log line, got %q", logs)
+	}
+}
+
+// The play really failed with 500: the recheck still sees "manual" and plays again.
+func TestTriggerPlay500NotApplied(t *testing.T) {
+	ref := &gitlab.PipelineRef{Project: "g/h", IID: "9"}
+	m := func(status string, ds *gitlab.PipelineRef) *gitlab.Pipeline {
+		return mainPipeline("1", bridge("bh", "helm-charts", status, ds))
+	}
+	api := newFake(map[string][]*gitlab.Pipeline{"1": {m("manual", nil), m("manual", nil), m("running", ref)}})
+	api.errs = map[string][]error{"play:bh": {err500}}
+	if _, err := newRun(api, helmSpec).Trigger(context.Background(), "g/p", "1", "helm-charts"); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(api.calls, []string{"play:bh", "play:bh"}) {
+		t.Errorf("calls = %v", api.calls)
+	}
+}
+
+func TestTriggerPlayPermanentErrorFails(t *testing.T) {
+	api := newFake(map[string][]*gitlab.Pipeline{"1": {mainPipeline("1", bridge("bh", "helm-charts", "manual", nil))}})
+	api.errs = map[string][]error{"play:bh": {&gitlab.APIError{StatusCode: 403, Body: "Forbidden"}}}
+	if _, err := newRun(api, helmSpec).Trigger(context.Background(), "g/p", "1", "helm-charts"); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+// A retry that answers 500 is rechecked; it is not counted toward MaxRetries.
+func TestBabysitRetry500IsRechecked(t *testing.T) {
+	api := newFake(map[string][]*gitlab.Pipeline{"9": {
+		tests("9", []gitlab.Job{job("s1", "failed")}, nil, nil),
+		tests("9", []gitlab.Job{job("s1", "failed")}, nil, nil),
+		tests("9", []gitlab.Job{job("s1b", "success")}, nil, nil),
+	}})
+	api.errs = map[string][]error{"retry:s1": {err500}}
+	run := newRun(api, testsSpec)
+	run.MaxRetries = 1
+	res, err := run.Babysit(context.Background(), gitlab.PipelineRef{IID: "9"})
+	if err != nil || !res.Passed {
+		t.Fatalf("res = %+v, err = %v", res, err)
+	}
+	if !slices.Equal(api.calls, []string{"retry:s1", "retry:s1"}) {
+		t.Errorf("calls = %v", api.calls)
 	}
 }

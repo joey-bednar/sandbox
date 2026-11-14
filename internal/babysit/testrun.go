@@ -41,6 +41,7 @@ type TestRun struct {
 	Log        func(string) // receives one line per event; nil discards
 
 	retries map[string]int
+	recheck bool // poll again after recheckDelay instead of Interval
 }
 
 // Result is the outcome of Babysit.
@@ -98,10 +99,13 @@ func (t *TestRun) Trigger(ctx context.Context, project, iid, jobName string) (*g
 			case job.DownstreamRef != nil:
 				return job.DownstreamRef, nil
 			case job.Status == "manual":
-				if err := t.API.PlayJob(ctx, job.ID); err != nil {
+				ok, err := t.mutate("playing "+jobName, func() error { return t.API.PlayJob(ctx, job.ID) })
+				if err != nil {
 					return nil, err
 				}
-				t.log("triggered %s in pipeline #%s", jobName, iid)
+				if ok {
+					t.log("triggered %s in pipeline #%s", jobName, iid)
+				}
 			case job.Status == "failed" || job.Status == "canceled":
 				if err := t.retry(ctx, job, "trigger"); err != nil {
 					return nil, err
@@ -212,10 +216,13 @@ func (t *TestRun) running(ctx context.Context, p *gitlab.Pipeline, hold *gitlab.
 	// skipped held jobs back to "created".
 	for _, j := range hold.Jobs {
 		if slices.Contains(holdable, j.Status) {
-			if err := t.API.CancelJob(ctx, j.ID); err != nil {
+			ok, err := t.mutate("canceling "+j.Name, func() error { return t.API.CancelJob(ctx, j.ID) })
+			if err != nil {
 				return nil, err
 			}
-			t.log("holding %s job %s (canceled)", hold.Name, j.Name)
+			if ok {
+				t.log("holding %s job %s (canceled)", hold.Name, j.Name)
+			}
 		}
 	}
 	// Canceled jobs are retried too: babysit only cancels held jobs, so
@@ -235,10 +242,15 @@ func (t *TestRun) running(ctx context.Context, p *gitlab.Pipeline, hold *gitlab.
 func (t *TestRun) release(ctx context.Context, hold *gitlab.Stage) error {
 	for _, j := range hold.Jobs {
 		if j.Status == "canceled" {
-			if err := t.API.RetryJob(ctx, j.ID); err != nil {
+			// If this fails transiently and didn't take effect, cleanup()
+			// retries the still-canceled job on a later poll.
+			ok, err := t.mutate("releasing "+j.Name, func() error { return t.API.RetryJob(ctx, j.ID) })
+			if err != nil {
 				return err
 			}
-			t.log("released %s job %s", hold.Name, j.Name)
+			if ok {
+				t.log("released %s job %s", hold.Name, j.Name)
+			}
 		}
 	}
 	return nil
@@ -294,7 +306,8 @@ func (t *TestRun) retry(ctx context.Context, j gitlab.Job, stage string) error {
 	if t.MaxRetries > 0 && n > t.MaxRetries {
 		return fmt.Errorf("%w: %s job %s failed %d times (%s)", ErrTooManyRetries, stage, j.Name, n, j.WebURL)
 	}
-	if err := t.API.RetryJob(ctx, j.ID); err != nil {
+	ok, err := t.mutate(fmt.Sprintf("retrying %s job %s", stage, j.Name), func() error { return t.API.RetryJob(ctx, j.ID) })
+	if err != nil || !ok {
 		return err
 	}
 	t.retries[j.Name] = n
@@ -342,11 +355,38 @@ func pipelineURL(p *gitlab.Pipeline, ref gitlab.PipelineRef) string {
 	return fmt.Sprintf("pipeline #%s in %s", ref.IID, ref.Project)
 }
 
+// recheckDelay is how soon to poll again after a mutation failed transiently.
+const recheckDelay = 2 * time.Second
+
+// mutate runs a play/retry/cancel call. GitLab can apply a mutation and still
+// answer with a 5xx, so blindly resending it could act twice (or fail because
+// the job already moved on). Instead a transient failure is logged and the
+// next poll comes after recheckDelay: it re-reads the job's real status and
+// the normal logic issues the call again only if it is still needed.
+// ok reports whether the call succeeded; err is set only for permanent errors.
+func (t *TestRun) mutate(desc string, call func() error) (ok bool, err error) {
+	err = call()
+	if err == nil {
+		return true, nil
+	}
+	if !gitlab.IsTransient(err) {
+		return false, err
+	}
+	t.log("%s failed (%v); rechecking job status in %s before trying again", desc, err, recheckDelay)
+	t.recheck = true
+	return false, nil
+}
+
 func (t *TestRun) sleep(ctx context.Context) error {
+	d := t.Interval
+	if t.recheck {
+		d = min(d, recheckDelay)
+		t.recheck = false
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-time.After(t.Interval):
+	case <-time.After(d):
 		return nil
 	}
 }

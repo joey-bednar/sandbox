@@ -35,10 +35,18 @@ type APIError struct {
 	Method, URL string
 	StatusCode  int
 	Body        string
+	RequestID   string // X-Request-Id; GitLab admins can find it in the server logs
 }
 
 func (e *APIError) Error() string {
-	return fmt.Sprintf("%s %s: HTTP %d: %s", e.Method, e.URL, e.StatusCode, e.Body)
+	return fmt.Sprintf("%s %s: HTTP %d: %s%s", e.Method, e.URL, e.StatusCode, e.Body, requestIDSuffix(e.RequestID))
+}
+
+func requestIDSuffix(id string) string {
+	if id == "" {
+		return ""
+	}
+	return " (request id " + id + ")"
 }
 
 func (c *Client) do(req *http.Request) (*http.Response, []byte, error) {
@@ -57,6 +65,7 @@ func (c *Client) do(req *http.Request) (*http.Response, []byte, error) {
 			URL:        req.URL.Redacted(),
 			StatusCode: resp.StatusCode,
 			Body:       strings.TrimSpace(string(body)),
+			RequestID:  resp.Header.Get("X-Request-Id"),
 		}
 	}
 	return resp, body, nil
@@ -115,7 +124,7 @@ func (c *Client) graphQL(ctx context.Context, query string, vars map[string]any,
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Token)
 	req.Header.Set("Content-Type", "application/json")
-	_, body, err := c.do(req)
+	resp, body, err := c.do(req)
 	if err != nil {
 		return err
 	}
@@ -131,7 +140,7 @@ func (c *Client) graphQL(ctx context.Context, query string, vars map[string]any,
 		for i, e := range envelope.Errors {
 			msgs[i] = e.Message
 		}
-		return fmt.Errorf("graphql: %s", strings.Join(msgs, "; "))
+		return fmt.Errorf("graphql: %s%s", strings.Join(msgs, "; "), requestIDSuffix(resp.Header.Get("X-Request-Id")))
 	}
 	return json.Unmarshal(envelope.Data, out)
 }

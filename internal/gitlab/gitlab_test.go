@@ -87,6 +87,7 @@ func TestWaitForPipelinesTimeout(t *testing.T) {
 
 func TestAPIErrorSurfaced(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Request-Id", "01ABC")
 		w.WriteHeader(http.StatusUnauthorized)
 		fmt.Fprint(w, `{"message":"401 Unauthorized"}`)
 	}))
@@ -94,7 +95,7 @@ func TestAPIErrorSurfaced(t *testing.T) {
 
 	_, err := NewClient(srv.URL, "bad").FindPipelinesForSHA(context.Background(), "g/p", "abc")
 	var apiErr *APIError
-	if !errors.As(err, &apiErr) || apiErr.StatusCode != 401 {
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != 401 || !strings.Contains(err.Error(), "request id 01ABC") {
 		t.Fatalf("err = %v", err)
 	}
 }
