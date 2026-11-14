@@ -224,7 +224,7 @@ func (t *TestRun) running(ctx context.Context, p *gitlab.Pipeline, hold *gitlab.
 			if j.Status == "manual" && !j.AllowFailure {
 				blocking = append(blocking, j.Name)
 			}
-			allPassed = allPassed && passed(j)
+			allPassed = allPassed && JobPassed(j)
 		}
 	}
 	if msg := fmt.Sprintf("waiting on blocking manual job(s) %q; babysit does not play these, start them in GitLab", blocking); len(blocking) > 0 && msg != t.lastWait {
@@ -380,11 +380,11 @@ func (t *TestRun) retry(ctx context.Context, j gitlab.Job, stage string) error {
 	return nil
 }
 
-// passed reports whether j no longer stands in the way of its stage passing,
+// JobPassed reports whether j no longer stands in the way of its stage passing,
 // matching how GitLab computes stage status: skipped jobs (e.g. when:
 // on_failure jobs after a success) and optional manual jobs don't block.
 // Failed jobs never count, even if allowed to fail, so they get retried.
-func passed(j gitlab.Job) bool {
+func JobPassed(j gitlab.Job) bool {
 	switch j.Status {
 	case "success", "skipped":
 		return true

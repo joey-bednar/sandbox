@@ -55,7 +55,7 @@ Pipeline names are bold and underlined, stage names are bold, and everything is 
 | Color | Job | Stage | Pipeline |
 | --- | --- | --- | --- |
 | blue | running, pending, preparing, waiting_for_resource | a job is running, or some passed and others haven't started | triggered and being babysat |
-| green | success | every started job passed | passed |
+| green | success | passed: every job succeeded, was skipped, or is an optional manual job | passed |
 | red | failed, canceled (babysit will retry it) | a job failed | failed (e.g. too many retries or pushes) |
 | yellow | scheduled, or held back by babysit (Clean Up / Post Clean Up) | a job is paused | |
 | grey | created, skipped, manual | nothing has started | not triggered yet |

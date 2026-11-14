@@ -48,19 +48,26 @@ func plain(ls []line, w int) string {
 }
 
 func TestStageAndPipelineColor(t *testing.T) {
+	j := func(status string, optional bool) gitlab.Job {
+		return gitlab.Job{Status: status, AllowFailure: optional}
+	}
 	for _, c := range []struct {
-		jobs []Color
+		name string
+		jobs []gitlab.Job
 		want Color
 	}{
-		{[]Color{Green, Red, Blue}, Red},
-		{[]Color{Green, Blue}, Blue},
-		{[]Color{Yellow, Green}, Yellow},
-		{[]Color{Grey, Grey}, Grey},
-		{[]Color{Green, Green}, Green},
-		{[]Color{Green, Grey}, Blue},
+		{"any failed", []gitlab.Job{j("success", false), j("failed", false), j("running", false)}, Red},
+		{"any running", []gitlab.Job{j("success", false), j("pending", false)}, Blue},
+		{"paused", []gitlab.Job{j("scheduled", false), j("success", false)}, Yellow},
+		{"nothing ran", []gitlab.Job{j("created", false), j("manual", true)}, Grey},
+		{"all passed", []gitlab.Job{j("success", false), j("success", false)}, Green},
+		{"passed plus optional manual", []gitlab.Job{j("success", false), j("manual", true)}, Green},
+		{"passed plus skipped", []gitlab.Job{j("success", false), j("skipped", false)}, Green},
+		{"passed plus not started", []gitlab.Job{j("success", false), j("created", false)}, Blue},
+		{"passed plus blocking manual", []gitlab.Job{j("success", false), j("manual", false)}, Blue},
 	} {
-		if got := StageColor(c.jobs); got != c.want {
-			t.Errorf("StageColor(%v) = %v, want %v", c.jobs, got, c.want)
+		if got := StageColor(c.jobs, false); got != c.want {
+			t.Errorf("%s: StageColor = %v, want %v", c.name, got, c.want)
 		}
 	}
 	for _, c := range []struct {

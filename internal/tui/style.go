@@ -45,20 +45,26 @@ func JobColor(j gitlab.Job, held bool) Color {
 	}
 }
 
-// StageColor summarizes a stage from its jobs' colors: red if any job
-// failed, else blue if any is running, else yellow if any is paused, grey if
-// none has started, green once every started job passed, and blue while some
-// passed and others haven't started yet.
-func StageColor(jobs []Color) Color {
+// StageColor summarizes a stage from its jobs: red if any job failed, else
+// blue if any is running, else yellow if any is paused. Otherwise it is green
+// once the stage has passed the way GitLab counts it (jobs succeeded, were
+// skipped, or are optional manual jobs nobody has to play), with at least one
+// success; grey if nothing in it has run; and blue while some jobs passed and
+// others haven't started yet.
+func StageColor(jobs []gitlab.Job, held bool) Color {
+	colors := make([]Color, len(jobs))
+	for i, j := range jobs {
+		colors[i] = JobColor(j, held)
+	}
 	for _, c := range []Color{Red, Blue, Yellow} {
-		if slices.Contains(jobs, c) {
+		if slices.Contains(colors, c) {
 			return c
 		}
 	}
 	switch {
-	case !slices.Contains(jobs, Green):
+	case !slices.Contains(colors, Green):
 		return Grey
-	case !slices.Contains(jobs, Grey):
+	case !slices.ContainsFunc(jobs, func(j gitlab.Job) bool { return !babysit.JobPassed(j) }):
 		return Green
 	default:
 		return Blue

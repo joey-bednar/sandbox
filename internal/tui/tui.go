@@ -198,19 +198,16 @@ func (s *section) lines(w int) []line {
 	for _, stg := range st.Pipeline.Stages {
 		held := st.Holding && gitlab.SameStage(stg.Name, st.HoldStage)
 		jobs := make([]span, 0, len(stg.Jobs))
-		colors := make([]Color, 0, len(stg.Jobs))
 		for _, j := range stg.Jobs {
 			name := j.Name
 			if n := st.Retries[j.Name]; n > 0 {
 				name += fmt.Sprintf(" ↻%d", n)
 			}
-			c := JobColor(j, held)
-			colors = append(colors, c)
-			jobs = append(jobs, span{text: name, color: c})
+			jobs = append(jobs, span{text: name, color: JobColor(j, held)})
 		}
 		label := stg.Name + ":"
 		pad := span{text: strings.Repeat(" ", labelW-len([]rune(label))+2)}
-		out = append(out, wrap([]span{{text: "  "}, {text: label, color: StageColor(colors), bold: true}, pad}, jobs, w)...)
+		out = append(out, wrap([]span{{text: "  "}, {text: label, color: StageColor(stg.Jobs, held), bold: true}, pad}, jobs, w)...)
 	}
 	return out
 }
