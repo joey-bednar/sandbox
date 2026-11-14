@@ -15,13 +15,25 @@ git add -p
 go run -C ~/sandbox .             # commits what you staged, or a junk change if nothing is
                                   # staged, with the message "Get passing pipelines"
 go run -C ~/sandbox . --upgrade   # also play helm-charts' upgrade job (see below)
+go run -C ~/sandbox . --automated-testing   # only automated-testing
+go run -C ~/sandbox . --helm-charts         # only helm-charts
 ```
 
 `-C` makes Go build from this checkout, and babysit runs git in the directory you
 invoked it from (via `$PWD`). Plain `go run ~/sandbox` cannot work from another
 repo, because Go resolves the module from the current directory.
 
-The only option is `--upgrade`: in the helm-charts pipeline, babysit plays the manual job in the "Setup" stage whose name contains "upgrade" (case-insensitive). helm-charts doesn't count as passed until that job has run and passed; if it fails it is retried like any other job. If the pipeline has no such job, helm-charts fails instead of passing without it. Without `--upgrade` the job is left alone.
+Options:
+
+| Option | Aliases | Effect |
+| --- | --- | --- |
+| `--automated-testing` | `--automated-tests` | Only trigger and babysit automated-testing; helm-charts is never triggered |
+| `--helm-charts` | `--helm`, `--helm-chart` | Only trigger and babysit helm-charts; automated-testing is never triggered |
+| `--upgrade` | | Run the helm-charts upgrade (below) |
+
+With neither (or both) of `--automated-testing` and `--helm-charts`, babysit does both. `--upgrade` together with only `--automated-testing` is an error, since helm-charts wouldn't run.
+
+With `--upgrade`, in the helm-charts pipeline, babysit plays the manual job in the "Setup" stage whose name contains "upgrade" (case-insensitive). helm-charts doesn't count as passed until that job has run and passed; if it fails it is retried like any other job. If the pipeline has no such job, helm-charts fails instead of passing without it. Without `--upgrade` the job is left alone.
 
 The GitLab host and project come from the `origin` remote, and these settings are fixed:
 
@@ -67,7 +79,7 @@ If nothing is staged, babysit picks the first file (alphabetically) that changed
 
 ## Triggered pipelines
 
-After the main pipeline is found, babysit triggers two jobs from it and babysits them **concurrently**:
+After the main pipeline is found, babysit triggers two jobs from it (or just one, see Options) and babysits them **concurrently**:
 
 | | automated-testing | helm-charts |
 | --- | --- | --- |

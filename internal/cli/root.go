@@ -3,6 +3,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"github.com/joey-bednar/sandbox/internal/babysit"
 	"github.com/joey-bednar/sandbox/internal/git"
@@ -37,6 +39,8 @@ type options struct {
 	helmJob      string
 	maxPushes    int
 	upgrade      bool // play helm-charts' Setup job containing "upgrade"
+	onlyTests    bool // babysit only automated-testing
+	onlyHelm     bool // babysit only helm-charts
 }
 
 func defaultOptions() options {
@@ -78,6 +82,14 @@ func newRootCmd() *cobra.Command {
 	}
 	f := cmd.Flags()
 	f.BoolVar(&o.upgrade, "upgrade", false, "run the helm-charts upgrade")
+	f.BoolVar(&o.onlyTests, "automated-testing", false, "only get a passing automated-testing pipeline (alias: --automated-tests)")
+	f.BoolVar(&o.onlyHelm, "helm-charts", false, "only get a passing helm-charts pipeline (aliases: --helm, --helm-chart)")
+	f.SetNormalizeFunc(func(_ *pflag.FlagSet, name string) pflag.NormalizedName {
+		if canonical, ok := flagAliases[name]; ok {
+			name = canonical
+		}
+		return pflag.NormalizedName(name)
+	})
 	f.StringVar(&o.host, "debug-host", "", "GitLab host or base URL instead of the one from the remote")
 	f.StringVar(&o.project, "debug-project", "", "GitLab project path instead of the one from the remote")
 	f.DurationVar(&o.pollInterval, "debug-poll-interval", o.pollInterval, "how often to poll GitLab")
@@ -87,7 +99,17 @@ func newRootCmd() *cobra.Command {
 	return cmd
 }
 
+// flagAliases maps alternative flag spellings to the flag they stand for.
+var flagAliases = map[string]string{
+	"automated-tests": "automated-testing",
+	"helm":            "helm-charts",
+	"helm-chart":      "helm-charts",
+}
+
 func run(ctx context.Context, o options) error {
+	if o.upgrade && o.onlyTests && !o.onlyHelm {
+		return errors.New("--upgrade runs the helm-charts upgrade, but --automated-testing skips helm-charts")
+	}
 	token := os.Getenv(tokenEnv)
 	if token == "" {
 		return fmt.Errorf("%s is not set", tokenEnv)
@@ -193,32 +215,38 @@ func waitForMain(ctx context.Context, client *gitlab.Client, project, sha string
 	return client.WaitForStages(ctx, project, sha, o.stages, o.pollInterval, progress)
 }
 
-// buildSpecs describes the triggered pipelines to babysit.
+// buildSpecs describes the triggered pipelines to babysit: both, unless
+// exactly one of --automated-testing and --helm-charts was given.
 func buildSpecs(o options) []babysit.Spec {
-	specs := []babysit.Spec{
-		{
-			Name:          strings.TrimPrefix(o.testSuffix, "-"),
-			TriggerStages: o.stages,
-			MatchJob:      func(n string) bool { return strings.HasSuffix(n, o.testSuffix) },
-			HoldStage:     "Clean Up",
-			TimeoutStages: []string{"Execute Test Cases"},
-			JobTimeout:    o.testTimeout,
-		},
-		{
-			Name:          o.helmJob,
-			TriggerStages: []string{"Deploy and Test"},
-			MatchJob:      func(n string) bool { return n == o.helmJob },
-			HoldStage:     "Post Clean Up",
-			// Deploy can't pass on a retry; it needs a fresh commit.
-			NoRetryStages: []string{"Deploy"},
-			Repush:        true,
-		},
+	tests := babysit.Spec{
+		Name:          strings.TrimPrefix(o.testSuffix, "-"),
+		TriggerStages: o.stages,
+		MatchJob:      func(n string) bool { return strings.HasSuffix(n, o.testSuffix) },
+		HoldStage:     "Clean Up",
+		TimeoutStages: []string{"Execute Test Cases"},
+		JobTimeout:    o.testTimeout,
+	}
+	helm := babysit.Spec{
+		Name:          o.helmJob,
+		TriggerStages: []string{"Deploy and Test"},
+		MatchJob:      func(n string) bool { return n == o.helmJob },
+		HoldStage:     "Post Clean Up",
+		// Deploy can't pass on a retry; it needs a fresh commit.
+		NoRetryStages: []string{"Deploy"},
+		Repush:        true,
 	}
 	if o.upgrade {
-		specs[1].PlayStage = "Setup"
-		specs[1].PlayJob = func(n string) bool { return strings.Contains(strings.ToLower(n), "upgrade") }
+		helm.PlayStage = "Setup"
+		helm.PlayJob = func(n string) bool { return strings.Contains(strings.ToLower(n), "upgrade") }
 	}
-	return specs
+	switch {
+	case o.onlyTests && !o.onlyHelm:
+		return []babysit.Spec{tests}
+	case o.onlyHelm && !o.onlyTests:
+		return []babysit.Spec{helm}
+	default:
+		return []babysit.Spec{tests, helm}
+	}
 }
 
 // pushForNewPipeline commits a junk change, pushes it and returns the new main pipeline.
