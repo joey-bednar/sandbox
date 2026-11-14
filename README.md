@@ -113,7 +113,9 @@ Watched Monorepo Triggers pipelines follow, under their trigger job's name. A pi
 
 **GitLab 5xx errors on play/retry/cancel** don't stop babysit. GitLab sometimes applies the action and still answers 500, so babysit doesn't resend blindly. It re-reads the job's status 2s later and only acts again if the action didn't take effect. Error messages include GitLab's request ID, which an admin can look up in the server logs.
 
-These caps mean babysit always stops on its own, even if you're away. Whenever it gives up on a pipeline before releasing its held stage (too many retries, the 8h limit, Ctrl-C, or a GitLab error), it releases Clean Up / Post Clean Up on the way out so the environment still gets torn down. It doesn't wait for that clean-up to finish. If the release itself fails, the error says so and links the pipeline so you can retry those jobs by hand.
+These caps mean babysit always stops on its own, even if you're away. Whenever it gives up on a pipeline before releasing its held stage (too many retries, the 8h limit, Ctrl-C, or a GitLab error), it releases Clean Up / Post Clean Up on the way out so the environment still gets torn down. It doesn't wait for that clean-up to finish.
+
+**Ctrl-C** also stops the pipelines: before releasing clean-up, babysit cancels every running or queued job (running, pending, created, preparing, waiting_for_resource, scheduled) in the pipelines it is babysitting. That covers automated-testing, helm-charts and the watched Monorepo Triggers pipelines. The exception is the Clean Up / Post Clean Up jobs of automated-testing and helm-charts, which are left alone and released so the environment is torn down. Manual jobs aren't touched. Cancelling first means clean-up runs after the jobs ahead of it have stopped. Press Ctrl-C a second time to quit right away without waiting for this. Hitting the 8h limit or the retry cap only releases clean-up; it doesn't cancel anything. If the release itself fails, the error says so and links the pipeline so you can retry those jobs by hand.
 
 ## Development
 

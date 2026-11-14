@@ -18,7 +18,25 @@ var activeStatuses = []string{"created", "waiting_for_resource", "preparing", "p
 // stops with an error once nothing is left running but the pipeline can't
 // pass by retrying: a job was canceled (left alone, since someone or GitLab's
 // auto-cancel did it on purpose) or a required manual job is waiting.
+//
+// On Ctrl-C it cancels every running or queued job of the pipeline.
 func (t *TestRun) Watch(ctx context.Context, ref gitlab.PipelineRef) (*gitlab.Pipeline, error) {
+	p, err := t.watch(ctx, ref)
+	if err != nil && interrupted(ctx) {
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), exitTimeout)
+		defer cancel()
+		if snap, gerr := t.API.GetPipeline(rctx, ref.Project, ref.IID, 0); gerr != nil {
+			err = fmt.Errorf("%w; couldn't cancel its jobs: %v", err, gerr)
+		} else if n, cerr := t.cancelActive(rctx, snap, func(string) bool { return false }); cerr != nil {
+			err = fmt.Errorf("%w; canceling jobs failed after %d: %v", err, n, cerr)
+		} else if n > 0 {
+			err = fmt.Errorf("%w; canceled %d running/queued job(s)", err, n)
+		}
+	}
+	return p, err
+}
+
+func (t *TestRun) watch(ctx context.Context, ref gitlab.PipelineRef) (*gitlab.Pipeline, error) {
 	t.retries = map[string]int{}
 	var p *gitlab.Pipeline
 	for {

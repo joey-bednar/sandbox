@@ -157,32 +157,81 @@ var holdable = []string{"created", "waiting_for_resource", "preparing", "pending
 func (t *TestRun) Babysit(ctx context.Context, ref gitlab.PipelineRef) (*Result, error) {
 	released := false
 	res, err := t.babysit(ctx, ref, &released)
-	if err != nil && !released {
-		err = t.releaseOnExit(ctx, ref, err)
+	if err != nil {
+		err = t.giveUp(ctx, ref, err, released)
 	}
 	return res, err
 }
 
-// releaseTimeout bounds releasing held jobs when giving up.
-const releaseTimeout = time.Minute
+// ErrInterrupted is the context cause when the user pressed Ctrl-C. On it,
+// babysit also cancels the running and queued jobs of its pipelines.
+var ErrInterrupted = errors.New("interrupted")
 
-// releaseOnExit releases the held stage after babysit gave up with cause.
-// ctx may already be done, so it uses a fresh deadline.
-func (t *TestRun) releaseOnExit(ctx context.Context, ref gitlab.PipelineRef, cause error) error {
-	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+func interrupted(ctx context.Context) bool {
+	return errors.Is(context.Cause(ctx), ErrInterrupted)
+}
+
+// exitTimeout bounds the clean-up babysit does when giving up.
+const exitTimeout = time.Minute
+
+// giveUp runs when Babysit stops with cause. On Ctrl-C it cancels every
+// running or queued job outside HoldStage; then, unless HoldStage was
+// already released, it releases it so the environment still gets torn down.
+// ctx may already be done, so this uses a fresh deadline.
+func (t *TestRun) giveUp(ctx context.Context, ref gitlab.PipelineRef, cause error, released bool) error {
+	stop := interrupted(ctx)
+	if !stop && released {
+		return cause
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), exitTimeout)
 	defer cancel()
 	p, err := t.API.GetPipeline(rctx, ref.Project, ref.IID, 0)
-	if err == nil {
-		var hold *gitlab.Stage
-		if hold, _, err = t.split(p); err != nil {
-			return cause // no held stage, so nothing to release
+	if err != nil {
+		return fmt.Errorf("%w; couldn't stop or clean up %s: %v", cause, pipelineURL(nil, ref), err)
+	}
+	hold, _, splitErr := t.split(p)
+	if stop {
+		n, err := t.cancelActive(rctx, p, func(stage string) bool { return hold != nil && stage == hold.Name })
+		if err != nil {
+			return fmt.Errorf("%w; canceling jobs failed after %d: %v (%s)", cause, n, err, p.WebURL)
 		}
-		if err = t.release(rctx, hold); err == nil {
-			return cause
+		if n > 0 {
+			cause = fmt.Errorf("%w; canceled %d running/queued job(s)", cause, n)
 		}
 	}
-	return fmt.Errorf("%w; releasing %s failed (%v), so jobs babysit canceled there are still canceled: retry them from %s",
-		cause, t.Spec.HoldStage, err, pipelineURL(p, ref))
+	if released || splitErr != nil {
+		return cause // nothing held, so nothing to release
+	}
+	if err := t.release(rctx, hold); err != nil {
+		return fmt.Errorf("%w; releasing %s failed (%v), so jobs babysit canceled there are still canceled: retry them from %s",
+			cause, t.Spec.HoldStage, err, p.WebURL)
+	}
+	return cause
+}
+
+// cancelActive cancels every running or queued job of p outside the stages
+// skip selects, and returns how many it canceled.
+func (t *TestRun) cancelActive(ctx context.Context, p *gitlab.Pipeline, skip func(stage string) bool) (int, error) {
+	n := 0
+	for _, s := range p.Stages {
+		if skip(s.Name) {
+			continue
+		}
+		for _, j := range s.Jobs {
+			if !slices.Contains(holdable, j.Status) {
+				continue
+			}
+			ok, err := t.mutate("canceling "+j.Name, func() error { return t.API.CancelJob(ctx, j.ID) })
+			if err != nil {
+				return n, err
+			}
+			if ok {
+				n++
+				t.log("canceled %s job %s (%s)", s.Name, j.Name, j.Status)
+			}
+		}
+	}
+	return n, nil
 }
 
 func (t *TestRun) babysit(ctx context.Context, ref gitlab.PipelineRef, released *bool) (*Result, error) {

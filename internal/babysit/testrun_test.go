@@ -661,3 +661,61 @@ func TestCoordinatorWatchesTriggeredDownstreamPipelines(t *testing.T) {
 		t.Errorf("calls = %v, want retry:a1", api.calls)
 	}
 }
+
+func interruptAfter(d time.Duration) (context.Context, func()) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	tm := time.AfterFunc(d, func() { cancel(ErrInterrupted) })
+	return ctx, func() { tm.Stop(); cancel(nil) }
+}
+
+func TestBabysitCtrlCCancelsActiveJobsButNotCleanup(t *testing.T) {
+	api := newFake(map[string][]*gitlab.Pipeline{"9": {
+		tests("9",
+			[]gitlab.Job{job("s1", "success")},
+			[]gitlab.Job{job("e1", "running"), job("e2", "pending"), job("e3", "created"), job("e4", "failed"), job("m", "manual")},
+			[]gitlab.Job{job("c1", "created")}),
+		tests("9",
+			[]gitlab.Job{job("s1", "success")},
+			[]gitlab.Job{job("e1", "running"), job("e2", "pending"), job("e3", "created"), job("e4", "running"), job("m", "manual")},
+			[]gitlab.Job{job("c1", "canceled")}),
+	}})
+	ctx, stop := interruptAfter(20 * time.Millisecond)
+	defer stop()
+	_, err := newRun(api, testsSpec).Babysit(ctx, gitlab.PipelineRef{IID: "9"})
+	if !errors.Is(err, ErrInterrupted) || !strings.Contains(err.Error(), "canceled 4 running/queued job(s)") {
+		t.Fatalf("err = %v", err)
+	}
+	// While running: hold c1, retry e4. On Ctrl-C: cancel everything active
+	// outside Clean Up (not the manual job), then release c1.
+	want := []string{"cancel:c1", "retry:e4", "cancel:e1", "cancel:e2", "cancel:e3", "cancel:e4", "retry:c1"}
+	if !slices.Equal(api.calls, want) {
+		t.Errorf("calls = %v, want %v", api.calls, want)
+	}
+}
+
+func TestBabysitTimeLimitDoesNotCancelJobs(t *testing.T) {
+	api := newFake(map[string][]*gitlab.Pipeline{"9": {
+		tests("9", []gitlab.Job{job("s1", "running")}, nil, []gitlab.Job{job("c1", "canceled")}),
+	}})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	newRun(api, testsSpec).Babysit(ctx, gitlab.PipelineRef{IID: "9"})
+	if slices.Contains(api.calls, "cancel:s1") {
+		t.Errorf("calls = %v; only Ctrl-C should cancel jobs", api.calls)
+	}
+}
+
+func TestWatchCtrlCCancelsActiveJobs(t *testing.T) {
+	api := newFake(map[string][]*gitlab.Pipeline{"8": {
+		pipeline("8", stage("build", job("b", "running")), stage("test", job("u", "created"), job("m", "manual"))),
+	}})
+	ctx, stop := interruptAfter(20 * time.Millisecond)
+	defer stop()
+	_, err := newRun(api, Spec{Name: "lib"}).Watch(ctx, gitlab.PipelineRef{IID: "8"})
+	if !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("err = %v", err)
+	}
+	if want := []string{"cancel:b", "cancel:u"}; !slices.Equal(api.calls, want) {
+		t.Errorf("calls = %v, want %v", api.calls, want)
+	}
+}

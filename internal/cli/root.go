@@ -65,9 +65,20 @@ func defaultOptions() options {
 
 // Execute runs the root command. Ctrl-C cancels the context so babysit can
 // report what it left behind (e.g. clean-up jobs it is holding).
+//
+// The first Ctrl-C makes babysit cancel its pipelines' running and queued
+// jobs (except clean-up, which it releases) before exiting; a second one
+// kills it right away.
 func Execute() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	go func() {
+		<-sig
+		signal.Stop(sig) // restore the default, so a second Ctrl-C exits
+		cancel(babysit.ErrInterrupted)
+	}()
 	if err := newRootCmd().ExecuteContext(ctx); err != nil {
 		os.Exit(1)
 	}
