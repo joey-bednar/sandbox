@@ -2,7 +2,7 @@
 
 A CLI for babysitting flaky GitLab CI pipelines.
 
-Current scope: commit and push the staged changes, find the GitLab pipeline(s) created for that commit, and print their structure. The output shows stages, jobs, manual jobs, and child/downstream pipelines nested under their trigger jobs.
+Current scope: commit and push the staged changes, then poll GitLab until the wanted stages (by default "Monorepo Triggers" and "Deploy and Test") appear somewhere in the commit's pipeline tree. Those stages usually live in a downstream pipeline (Generate Root Pipeline > Create Main Pipeline) that only exists after the root pipeline's trigger job runs. babysit then prints those stages' jobs, marking manual jobs and trigger jobs. If the root pipeline finishes without ever creating the stages, babysit stops with an error that lists the stages it did see.
 
 ## Usage
 
@@ -27,27 +27,27 @@ Host and project are derived from the `origin` remote. Override as needed:
 | `--remote` | `origin` | Remote to push to and derive the project from |
 | `--host` | from remote | GitLab host or base URL (`https://` assumed) |
 | `--project` | from remote | Project path, e.g. `group/sub/project` |
-| `--timeout` | `3m` | How long to wait for GitLab to create a pipeline |
-| `--poll-interval` | `5s` | Polling interval while waiting |
-| `--stages` | `Monorepo Triggers,Deploy and Test` | Only show these top-level stages (case-insensitive; spaces, `-`, `_` equivalent) |
-| `--all-stages` | `false` | Show every stage |
-| `--grace` | `10s` | Extra wait after the first pipeline appears, to catch sibling pipelines (e.g. push + merge request) |
+| `--timeout` | `15m` | How long to wait for the stages to appear |
+| `--poll-interval` | `10s` | How often to poll GitLab |
+| `--stages` | `Monorepo Triggers,Deploy and Test` | Stages to look for in the pushed pipeline and its downstream pipelines (case-insensitive; spaces, `-`, `_` equivalent) |
+| `--all-stages` | `false` | Skip the stage search and show the full pushed pipeline(s) |
 
 Example output:
 
 ```
-Pipeline #10 (g/p, push, main) running  https://gitlab.example.com/g/p/-/pipelines/100
-├─ build [success]
-│  ├─ compile        success
-│  └─ lint           failed  (allowed to fail)
-├─ test [running]
-│  ├─ unit           running
-│  └─ e2e            created  ▶ manual
-└─ deploy [created]
-   └─ trigger-child  created  ⇢ downstream
-      └─ Pipeline #3 (g/child, parent_pipeline, main) created  https://gitlab.example.com/g/child/-/pipelines/300
-         └─ child-test [created]
-            └─ integ  created
+Waiting for stages ["Monorepo Triggers" "Deploy and Test"] in pipelines for baa6fdc72d78 on gitlab.example.com/g/p (polling every 10s)...
+  [0s] pipeline #100 running; stages not visible yet
+
+Pushed pipeline #100 (push): https://gitlab.example.com/g/p/-/pipelines/100
+Stages found via: Create Main Pipeline
+
+Pipeline #20 (g/p, parent_pipeline, main) running  https://gitlab.example.com/g/p/-/pipelines/200
+├─ Monorepo Triggers [running]
+│  ├─ trigger-web     running  ⇢ downstream
+│  └─ trigger-api     created  ▶ manual  ⇢ downstream
+└─ Deploy and Test [created]
+   ├─ deploy-staging  created
+   └─ smoke-tests     created  ▶ manual
 ```
 
 ## Development

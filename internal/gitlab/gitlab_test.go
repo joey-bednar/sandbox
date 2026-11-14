@@ -59,14 +59,14 @@ func TestWaitForPipelinesPollsUntilFound(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "tok")
-	ps, err := c.WaitForPipelines(context.Background(), "g/p", "abc", 5*time.Millisecond, 5*time.Millisecond)
+	ps, err := c.WaitForPipelines(context.Background(), "g/p", "abc", 5*time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(ps) != 1 || ps[0].ID != 7 {
 		t.Fatalf("got %+v", ps)
 	}
-	if calls.Load() != 4 { // 2 empty + found + grace re-poll
+	if calls.Load() != 3 { // 2 empty + found
 		t.Fatalf("calls = %d", calls.Load())
 	}
 }
@@ -79,7 +79,7 @@ func TestWaitForPipelinesTimeout(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
-	_, err := NewClient(srv.URL, "tok").WaitForPipelines(ctx, "g/p", "abc", 5*time.Millisecond, 0)
+	_, err := NewClient(srv.URL, "tok").WaitForPipelines(ctx, "g/p", "abc", 5*time.Millisecond)
 	if !errors.Is(err, ErrNoPipeline) {
 		t.Fatalf("err = %v", err)
 	}

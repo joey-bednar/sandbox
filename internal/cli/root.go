@@ -26,7 +26,6 @@ type options struct {
 	project      string
 	timeout      time.Duration
 	pollInterval time.Duration
-	grace        time.Duration
 	stages       []string
 	allStages    bool
 }
@@ -57,11 +56,10 @@ func newRootCmd() *cobra.Command {
 	f.StringVar(&o.remote, "remote", "origin", "git remote to push to")
 	f.StringVar(&o.host, "host", "", "GitLab host or base URL (default: derived from the remote URL, https assumed)")
 	f.StringVar(&o.project, "project", "", "GitLab project path, e.g. group/project (default: derived from the remote URL)")
-	f.DurationVar(&o.timeout, "timeout", 3*time.Minute, "how long to wait for GitLab to create the pipeline")
-	f.DurationVar(&o.pollInterval, "poll-interval", 5*time.Second, "how often to poll for the pipeline")
-	f.DurationVar(&o.grace, "grace", 10*time.Second, "extra wait after the first pipeline appears, to catch sibling pipelines")
-	f.StringSliceVar(&o.stages, "stages", defaultStages, "only show these top-level stages (case-insensitive; spaces, '-' and '_' are equivalent)")
-	f.BoolVar(&o.allStages, "all-stages", false, "show every stage, ignoring --stages")
+	f.DurationVar(&o.timeout, "timeout", 15*time.Minute, "how long to wait for the stages to appear")
+	f.DurationVar(&o.pollInterval, "poll-interval", 10*time.Second, "how often to poll GitLab")
+	f.StringSliceVar(&o.stages, "stages", defaultStages, "stages to look for in the pipeline and its downstream pipelines (case-insensitive; spaces, '-' and '_' are equivalent)")
+	f.BoolVar(&o.allStages, "all-stages", false, "skip the stage search and show the full pushed pipeline(s)")
 	_ = cmd.MarkFlagRequired("message")
 	return cmd
 }
@@ -111,46 +109,52 @@ func run(ctx context.Context, o options) error {
 		baseURL = "https://" + host
 	}
 	client := gitlab.NewClient(baseURL, token)
-	fmt.Printf("\nWaiting for pipeline(s) for %s on %s/%s...\n", sha[:min(len(sha), 12)], host, project)
 	waitCtx, cancel := context.WithTimeout(ctx, o.timeout)
 	defer cancel()
-	pipelines, err := client.WaitForPipelines(waitCtx, project, sha, o.pollInterval, o.grace)
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("Found %d pipeline(s):\n", len(pipelines))
-	for _, p := range pipelines {
-		fmt.Printf("  #%d  %-20s %-30s %-10s %s\n", p.ID, p.Source, p.Ref, p.Status, p.WebURL)
-	}
-
 	color := isTerminal(os.Stdout)
-	for _, p := range pipelines {
-		structure, err := client.GetPipelineStructure(ctx, project, p.IID)
+	short := sha[:min(len(sha), 12)]
+
+	if o.allStages {
+		fmt.Printf("\nWaiting for pipeline(s) for %s on %s/%s...\n", short, host, project)
+		pipelines, err := client.WaitForPipelines(waitCtx, project, sha, o.pollInterval)
 		if err != nil {
 			return err
 		}
-		if !o.allStages {
-			var missing []string
-			all := structure
-			structure, missing = gitlab.FilterStages(all, o.stages)
-			if len(missing) > 0 {
-				fmt.Fprintf(os.Stderr, "\nwarning: pipeline #%s has no stage(s) %q; available: %q\n",
-					all.IID, missing, stageNames(all))
+		for _, p := range pipelines {
+			structure, err := client.GetPipelineStructure(ctx, project, p.IID)
+			if err != nil {
+				return err
 			}
+			fmt.Println()
+			render.Tree(os.Stdout, structure, color)
 		}
+		return nil
+	}
+
+	fmt.Printf("\nWaiting for stages %q in pipelines for %s on %s/%s (polling every %s)...\n",
+		o.stages, short, host, project, o.pollInterval)
+	start := time.Now()
+	last := ""
+	progress := func(msg string) {
+		if msg != last { // only print when something changes
+			fmt.Printf("  [%s] %s\n", time.Since(start).Round(time.Second), msg)
+			last = msg
+		}
+	}
+	matches, err := client.WaitForStages(waitCtx, project, sha, o.stages, o.pollInterval, progress)
+	if err != nil {
+		return err
+	}
+	for _, m := range matches {
+		fmt.Printf("\nPushed pipeline #%d (%s): %s\n", m.Root.ID, m.Root.Source, m.Root.WebURL)
+		if len(m.Via) > 0 {
+			fmt.Printf("Stages found via: %s\n", strings.Join(m.Via, " > "))
+		}
+		filtered, _ := gitlab.FilterStages(m.Pipeline, o.stages)
 		fmt.Println()
-		render.Tree(os.Stdout, structure, color)
+		render.Tree(os.Stdout, filtered, color)
 	}
 	return nil
-}
-
-func stageNames(p *gitlab.Pipeline) []string {
-	names := make([]string, len(p.Stages))
-	for i, s := range p.Stages {
-		names[i] = s.Name
-	}
-	return names
 }
 
 func resolveProject(repo *git.Repo, o options) (host, project string, err error) {

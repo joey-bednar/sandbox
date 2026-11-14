@@ -31,10 +31,9 @@ func (c *Client) FindPipelinesForSHA(ctx context.Context, project, sha string) (
 // ErrNoPipeline is returned when no pipeline appears before the context expires.
 var ErrNoPipeline = errors.New("no pipeline found for commit")
 
-// WaitForPipelines polls until at least one pipeline exists for sha, then waits
-// grace once more to pick up sibling pipelines (e.g. push + merge_request_event)
-// that GitLab creates slightly later. It returns when ctx is done or pipelines are found.
-func (c *Client) WaitForPipelines(ctx context.Context, project, sha string, interval, grace time.Duration) ([]PipelineSummary, error) {
+// WaitForPipelines polls every interval until at least one pipeline exists
+// for sha, or ctx is done.
+func (c *Client) WaitForPipelines(ctx context.Context, project, sha string, interval time.Duration) ([]PipelineSummary, error) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -43,7 +42,7 @@ func (c *Client) WaitForPipelines(ctx context.Context, project, sha string, inte
 			return nil, err
 		}
 		if len(ps) > 0 {
-			return c.afterGrace(ctx, project, sha, grace, ps), nil
+			return ps, nil
 		}
 		select {
 		case <-ctx.Done():
@@ -51,20 +50,4 @@ func (c *Client) WaitForPipelines(ctx context.Context, project, sha string, inte
 		case <-ticker.C:
 		}
 	}
-}
-
-func (c *Client) afterGrace(ctx context.Context, project, sha string, grace time.Duration, found []PipelineSummary) []PipelineSummary {
-	if grace <= 0 {
-		return found
-	}
-	select {
-	case <-ctx.Done():
-		return found
-	case <-time.After(grace):
-	}
-	ps, err := c.FindPipelinesForSHA(ctx, project, sha)
-	if err != nil || len(ps) < len(found) {
-		return found
-	}
-	return ps
 }
