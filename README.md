@@ -35,6 +35,7 @@ Host and project are derived from the `origin` remote. Override as needed:
 | `--all-stages` | `false` | Skip the stage search and show the full pushed pipeline(s) |
 | `--test-job-suffix` | `-automated-testing` | Trigger and babysit the job ending in this suffix; empty disables |
 | `--helm-job` | `helm-charts` | Trigger and babysit the job with this exact name in "Deploy and Test"; empty disables |
+| `--test-job-timeout` | `20m` | Restart automated-testing "Execute Test Cases" jobs that run longer than this (0 disables) |
 | `--max-retries` | `0` | Give up after a job fails this many times (0 = retry forever) |
 | `--max-pushes` | `5` | For helm-charts: give up after pushing this many new commits (0 = unlimited) |
 
@@ -51,11 +52,13 @@ After the main pipeline is found, babysit triggers two jobs from it and babysits
 | Trigger job | ends in `-automated-testing`, in "Monorepo Triggers" or "Deploy and Test" | exactly `helm-charts`, in "Deploy and Test" |
 | Held stage | Clean Up | Post Clean Up |
 | Never retried | (none) | Deploy |
+| Restarted if running > `--test-job-timeout` | Execute Test Cases | (none) |
 
 Each triggered pipeline goes through the same steps. On every poll:
 
 1. **Hold:** cancel any job in the held stage that is queued or running. This repeats on every poll because GitLab re-queues skipped jobs whenever an earlier job is retried.
 2. **Retry:** retry every failed or canceled job in the other stages. babysit only ever cancels held jobs, so anything else canceled was interrupted, e.g. auto-canceled by a newer push.
+   Before that, any job in a timed stage (automated-testing's Execute Test Cases) that has been running longer than `--test-job-timeout` is canceled; GitLab can't retry a running job, so it is retried on the next poll like any other canceled job. Restarts count toward `--max-retries`.
 3. **Release:** once every other stage has passed, retry the canceled held jobs so they run. "Passed" follows GitLab's UI: a stage passes when its jobs succeeded, were skipped, or are optional manual jobs. If a manual job that GitLab requires someone to play is in the way, babysit says so and waits; it never plays those.
 4. **Clean up:** retry failed held jobs until they all finish. The pipeline then counts as passed.
 

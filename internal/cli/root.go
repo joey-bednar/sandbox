@@ -33,6 +33,7 @@ type options struct {
 	allStages    bool
 	testSuffix   string
 	maxRetries   int
+	testTimeout  time.Duration
 	base         string
 	helmJob      string
 	maxPushes    int
@@ -77,6 +78,7 @@ func newRootCmd() *cobra.Command {
 	f.StringVar(&o.testSuffix, "test-job-suffix", "-automated-testing", "trigger and babysit the job with this name suffix; empty disables")
 	f.StringVar(&o.helmJob, "helm-job", "helm-charts", "trigger and babysit the job with this exact name in \"Deploy and Test\"; empty disables")
 	f.IntVar(&o.maxPushes, "max-pushes", 5, "for helm-charts: give up after pushing this many new commits (0 = unlimited)")
+	f.DurationVar(&o.testTimeout, "test-job-timeout", 20*time.Minute, `restart automated-testing "Execute Test Cases" jobs running longer than this (0 disables)`)
 	f.IntVar(&o.maxRetries, "max-retries", 0, "give up after a job fails this many times (0 = retry forever)")
 	return cmd
 }
@@ -212,6 +214,8 @@ func buildSpecs(o options) []babysit.Spec {
 			TriggerStages: o.stages,
 			MatchJob:      func(n string) bool { return strings.HasSuffix(n, o.testSuffix) },
 			HoldStage:     "Clean Up",
+			TimeoutStages: []string{"Execute Test Cases"},
+			JobTimeout:    o.testTimeout,
 		})
 	}
 	if o.helmJob != "" {

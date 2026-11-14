@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // MaxDownstreamDepth caps recursion into child/multi-project pipelines.
@@ -36,6 +37,7 @@ type Job struct {
 	AllowFailure bool
 	Bridge       bool
 	WebURL       string
+	StartedAt    time.Time // zero until the job starts running
 	// DownstreamRef identifies the pipeline a trigger job created, if any.
 	// Downstream holds its full structure when it was fetched recursively.
 	DownstreamRef *PipelineRef
@@ -60,7 +62,7 @@ query($path: ID!, $iid: ID!) {
             nodes {
               jobs {
                 nodes {
-                  id name status kind manualJob allowFailure webPath
+                  id name status kind manualJob allowFailure webPath startedAt
                   downstreamPipeline { iid project { fullPath } }
                 }
               }
@@ -73,13 +75,14 @@ query($path: ID!, $iid: ID!) {
 }`
 
 type gqlJob struct {
-	ID                 string `json:"id"`
-	Name               string `json:"name"`
-	Status             string `json:"status"`
-	Kind               string `json:"kind"`
-	ManualJob          bool   `json:"manualJob"`
-	AllowFailure       bool   `json:"allowFailure"`
-	WebPath            string `json:"webPath"`
+	ID                 string     `json:"id"`
+	Name               string     `json:"name"`
+	Status             string     `json:"status"`
+	Kind               string     `json:"kind"`
+	ManualJob          bool       `json:"manualJob"`
+	AllowFailure       bool       `json:"allowFailure"`
+	WebPath            string     `json:"webPath"`
+	StartedAt          *time.Time `json:"startedAt"`
 	DownstreamPipeline *struct {
 		IID     string `json:"iid"`
 		Project struct {
@@ -163,6 +166,9 @@ func (c *Client) getStructure(ctx context.Context, project, iid string, depth, m
 					AllowFailure: gj.AllowFailure,
 					Bridge:       gj.Kind == "BRIDGE",
 					WebURL:       c.webURL(gj.WebPath),
+				}
+				if gj.StartedAt != nil {
+					j.StartedAt = *gj.StartedAt
 				}
 				if ds := gj.DownstreamPipeline; ds != nil {
 					j.DownstreamRef = &PipelineRef{Project: ds.Project.FullPath, IID: ds.IID}

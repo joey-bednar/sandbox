@@ -400,3 +400,35 @@ func TestBabysitReportsBlockingManualJob(t *testing.T) {
 		t.Errorf("expected the blocking-job message exactly once, got %d in %q", n, logs)
 	}
 }
+
+func TestBabysitRestartsOverdueTestCases(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	running := func(id string, mins int) gitlab.Job {
+		j := job(id, "running")
+		j.StartedAt = now.Add(-time.Duration(mins) * time.Minute)
+		return j
+	}
+	slowSetup := running("s1", 30) // Setup has no timeout
+	api := newFake(map[string][]*gitlab.Pipeline{"9": {
+		// e1 is over 20m, e2 isn't: cancel only e1
+		tests("9", []gitlab.Job{slowSetup}, []gitlab.Job{running("e1", 21), running("e2", 5)}, []gitlab.Job{job("c1", "manual")}),
+		// e1 canceled: retry it
+		tests("9", []gitlab.Job{job("s1", "success")}, []gitlab.Job{job("e1", "canceled"), running("e2", 6)}, []gitlab.Job{job("c1", "manual")}),
+		tests("9", []gitlab.Job{job("s1", "success")}, []gitlab.Job{job("e1b", "success"), job("e2", "success")}, []gitlab.Job{job("c1", "success")}),
+	}})
+	spec := testsSpec
+	spec.TimeoutStages = []string{"execute test cases"}
+	spec.JobTimeout = 20 * time.Minute
+	run := newRun(api, spec)
+	run.Now = func() time.Time { return now }
+	res, err := run.Babysit(context.Background(), gitlab.PipelineRef{IID: "9"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Passed {
+		t.Fatalf("result = %+v", res)
+	}
+	if want := []string{"cancel:e1", "retry:e1"}; !slices.Equal(api.calls, want) {
+		t.Errorf("calls = %v, want %v", api.calls, want)
+	}
+}

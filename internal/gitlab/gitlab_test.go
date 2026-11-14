@@ -144,7 +144,7 @@ func TestGetPipelineStructureRecursesDownstream(t *testing.T) {
 	parent := `{"iid":"10","status":"RUNNING","source":"push","ref":"feat","path":"/g/p/-/pipelines/100",
 	  "stages":{"nodes":[
 	    {"name":"build","status":"SUCCESS","groups":{"nodes":[{"jobs":{"nodes":[
-	      {"id":"gid://gitlab/Ci::Build/1","name":"compile","status":"SUCCESS","kind":"BUILD","webPath":"/g/p/-/jobs/1"}]}}]}},
+	      {"id":"gid://gitlab/Ci::Build/1","name":"compile","status":"SUCCESS","kind":"BUILD","webPath":"/g/p/-/jobs/1","startedAt":"2026-01-02T03:04:05Z"}]}}]}},
 	    {"name":"deploy","status":"MANUAL","groups":{"nodes":[{"jobs":{"nodes":[
 	      {"id":"gid://gitlab/Ci::Build/2","name":"release","status":"MANUAL","kind":"BUILD","manualJob":true},
 	      {"id":"gid://gitlab/Ci::Bridge/3","name":"trigger","status":"SUCCESS","kind":"BRIDGE",
@@ -162,6 +162,9 @@ func TestGetPipelineStructureRecursesDownstream(t *testing.T) {
 	}
 	if p.Status != "running" || p.WebURL != srv.URL+"/g/p/-/pipelines/100" || len(p.Stages) != 2 {
 		t.Fatalf("parent = %+v", p)
+	}
+	if got := p.Stages[0].Jobs[0].StartedAt; !got.Equal(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)) {
+		t.Fatalf("startedAt = %v", got)
 	}
 	deploy := p.Stages[1]
 	if !deploy.Jobs[0].Manual || deploy.Jobs[0].WebURL != "" {

@@ -30,6 +30,10 @@ type Spec struct {
 	HoldStage     string                 // canceled until everything else passes, then released
 	NoRetryStages []string               // a failure here can't be fixed by retrying
 	Repush        bool                   // on such a failure, push a new commit and start over
+	// Jobs in TimeoutStages running longer than JobTimeout are canceled and
+	// then retried like any other canceled job. JobTimeout 0 disables this.
+	TimeoutStages []string
+	JobTimeout    time.Duration
 }
 
 // TestRun babysits one triggered pipeline according to Spec.
@@ -38,7 +42,8 @@ type TestRun struct {
 	Interval   time.Duration
 	MaxRetries int // per job name; 0 means retry forever
 	Spec       Spec
-	Log        func(string) // receives one line per event; nil discards
+	Log        func(string)     // receives one line per event; nil discards
+	Now        func() time.Time // clock for job timeouts; nil means time.Now
 
 	retries  map[string]int
 	recheck  bool   // poll again after recheckDelay instead of Interval
@@ -234,8 +239,12 @@ func (t *TestRun) running(ctx context.Context, p *gitlab.Pipeline, hold *gitlab.
 			}
 		}
 	}
-	// Canceled jobs are retried too: babysit only cancels held jobs, so
-	// anything else canceled was interrupted (e.g. by auto-cancel on push).
+	if err := t.cancelOverdue(ctx, rest); err != nil {
+		return nil, err
+	}
+	// Canceled jobs are retried too: babysit only cancels held jobs and
+	// overdue ones, so anything else canceled was interrupted (e.g. by
+	// auto-cancel on push).
 	for _, s := range rest {
 		for _, j := range s.Jobs {
 			if j.Status == "failed" || j.Status == "canceled" {
@@ -246,6 +255,42 @@ func (t *TestRun) running(ctx context.Context, p *gitlab.Pipeline, hold *gitlab.
 		}
 	}
 	return nil, nil
+}
+
+// cancelOverdue cancels running jobs in Spec.TimeoutStages that started more
+// than Spec.JobTimeout ago. GitLab can't retry a running job, so the restart
+// happens on a later poll, when retry picks up the canceled job.
+func (t *TestRun) cancelOverdue(ctx context.Context, stages []gitlab.Stage) error {
+	if t.Spec.JobTimeout <= 0 {
+		return nil
+	}
+	now := time.Now
+	if t.Now != nil {
+		now = t.Now
+	}
+	for _, s := range stages {
+		if !slices.ContainsFunc(t.Spec.TimeoutStages, func(n string) bool { return gitlab.SameStage(n, s.Name) }) {
+			continue
+		}
+		for _, j := range s.Jobs {
+			if j.Status != "running" || j.StartedAt.IsZero() {
+				continue
+			}
+			ran := now().Sub(j.StartedAt)
+			if ran <= t.Spec.JobTimeout {
+				continue
+			}
+			ok, err := t.mutate("canceling overdue "+j.Name, func() error { return t.API.CancelJob(ctx, j.ID) })
+			if err != nil {
+				return err
+			}
+			if ok {
+				t.log("%s job %s has run for %s (limit %s); canceled, will restart %s",
+					s.Name, j.Name, ran.Round(time.Second), t.Spec.JobTimeout, j.WebURL)
+			}
+		}
+	}
+	return nil
 }
 
 func (t *TestRun) release(ctx context.Context, hold *gitlab.Stage) error {
