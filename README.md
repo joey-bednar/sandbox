@@ -53,7 +53,7 @@ For testing against a fake GitLab there are hidden flags, left out of `--help`: 
 
 ## Display
 
-In a terminal, babysit takes over the screen with a live dashboard that shows only the babysat pipelines, automated-testing and helm-charts. It is redrawn whenever any pipeline changes (and when the terminal is resized). Each section lists the pipeline's stages and their jobs:
+In a terminal, babysit takes over the screen with a live dashboard headed "Pipeline Status" that shows only the babysat pipelines, automated-testing and helm-charts. It is redrawn whenever any pipeline changes (and when the terminal is resized). Each section lists the pipeline's stages and their jobs:
 
 ```
 automated-testing

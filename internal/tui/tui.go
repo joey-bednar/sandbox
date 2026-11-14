@@ -179,11 +179,9 @@ func (d *Dashboard) redraw() {
 
 // frame lays out the whole dashboard for width w.
 func (d *Dashboard) frame(w int) []line {
-	var out []line
-	for i, s := range d.sections {
-		if i > 0 {
-			out = append(out, line{})
-		}
+	out := []line{{{text: "Pipeline Status", bold: true}}}
+	for _, s := range d.sections {
+		out = append(out, line{})
 		out = append(out, s.lines(w)...)
 	}
 	return out
