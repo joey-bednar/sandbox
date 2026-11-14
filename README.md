@@ -2,7 +2,7 @@
 
 A CLI for babysitting flaky GitLab CI pipelines.
 
-Current scope: commit and push the staged changes (or, if nothing is staged, a junk change to start a fresh pipeline), then poll GitLab until the wanted stages (by default "Monorepo Triggers" and "Deploy and Test") appear somewhere in the commit's pipeline tree. Those stages usually live in a downstream pipeline (Generate Root Pipeline > Create Main Pipeline) that only exists after the root pipeline's trigger job runs. babysit then prints those stages' jobs, marking manual jobs and trigger jobs. If the root pipeline finishes without ever creating the stages, babysit stops with an error that lists the stages it did see.
+Current scope: commit and push the staged changes (or, if nothing is staged, a junk change to start a fresh pipeline), then poll GitLab until the wanted stages (by default "Monorepo Triggers" and "Deploy and Test") appear somewhere in the commit's pipeline tree. Those stages usually live in a downstream pipeline (Generate Root Pipeline > Create Main Pipeline) that only exists after the root pipeline's trigger job runs. babysit then prints those stages' jobs, marking manual jobs and trigger jobs. If the root pipeline finishes without ever creating the stages, babysit stops with an error that lists the stages it did see. It then triggers automated-testing and helm-charts and babysits both until they pass (see below).
 
 ## Usage
 
@@ -34,39 +34,44 @@ Host and project are derived from the `origin` remote. Override as needed:
 | `--stages` | `Monorepo Triggers,Deploy and Test` | Stages to look for in the pushed pipeline and its downstream pipelines (case-insensitive; spaces, `-`, `_` equivalent) |
 | `--all-stages` | `false` | Skip the stage search and show the full pushed pipeline(s) |
 | `--test-job-suffix` | `-automated-testing` | Trigger and babysit the job ending in this suffix; empty disables |
+| `--helm-job` | `helm-charts` | Trigger and babysit the job with this exact name in "Deploy and Test"; empty disables |
 | `--max-retries` | `0` | Give up after a job fails this many times (0 = retry forever) |
+| `--max-pushes` | `5` | For helm-charts: give up after pushing this many new commits (0 = unlimited) |
 
 ## Junk changes
 
 If nothing is staged, babysit picks the first file (alphabetically) that changed on this branch since it split from `--base`. It skips files with uncommitted edits and binary files. It then toggles that file's trailing newline: it removes the newline if one is there, and adds one otherwise. It stages that change and commits it. Running it again flips the newline back, so these commits never pile up into a real diff.
 
-## Test babysitting
+## Triggered pipelines
 
-After the stages are found, babysit triggers the one job ending in `-automated-testing`. It waits for that job to become playable, plays it, and follows the pipeline it creates. On every poll of that pipeline it then:
+After the main pipeline is found, babysit triggers two jobs from it and babysits them **concurrently**:
 
-1. Holds **Clean Up**: it cancels any Clean Up job that is queued or running. This repeats on every poll because GitLab re-queues skipped Clean Up jobs whenever an earlier job is retried.
-2. Retries every failed job in **Setup** and **Execute Test Cases**. Test cases only run after Setup passes, so in practice it finishes Setup first.
-3. Once every Setup and Execute Test Cases job has passed, it retries the canceled Clean Up jobs so they run, then prints the pipeline links for your MR.
+| | automated-testing | helm-charts |
+| --- | --- | --- |
+| Trigger job | ends in `-automated-testing`, in "Monorepo Triggers" or "Deploy and Test" | exactly `helm-charts`, in "Deploy and Test" |
+| Held stage | Clean Up | Post Clean Up |
+| Never retried | (none) | Deploy |
 
-If you stop babysit (Ctrl-C) before it finishes, Clean Up jobs it canceled stay canceled. It prints the test pipeline link so you can retry them by hand.
+Each triggered pipeline goes through the same steps. On every poll:
 
-Example output:
+1. **Hold:** cancel any job in the held stage that is queued or running. This repeats on every poll because GitLab re-queues skipped jobs whenever an earlier job is retried.
+2. **Retry:** retry every failed or canceled job in the other stages. babysit only ever cancels held jobs, so anything else canceled was interrupted, e.g. auto-canceled by a newer push.
+3. **Release:** once every other stage has passed, retry the canceled held jobs so they run.
+4. **Clean up:** retry failed held jobs until they all finish. The pipeline then counts as passed.
+
+**helm-charts Deploy failures** can't be fixed by retrying. When one happens, babysit still releases Post Clean Up and waits for it, so the environment is torn down. Then it pushes a junk commit (see above; only that file is committed, so anything you've staged meanwhile is left alone), waits for the new main pipeline, and triggers helm-charts there. This repeats up to `--max-pushes` times. automated-testing is not re-triggered; it keeps going (or stays done) in the pipeline it started in.
+
+At the end babysit prints the passing pipeline for each, which may be from different commits:
 
 ```
-Waiting for stages ["Monorepo Triggers" "Deploy and Test"] in pipelines for baa6fdc72d78 on gitlab.example.com/g/p (polling every 10s)...
-  [0s] pipeline #100 running; stages not visible yet
-
-Pushed pipeline #100 (push): https://gitlab.example.com/g/p/-/pipelines/100
-Stages found via: Create Main Pipeline
-
-Pipeline #20 (g/p, parent_pipeline, main) running  https://gitlab.example.com/g/p/-/pipelines/200
-├─ Monorepo Triggers [running]
-│  ├─ trigger-web     running  ⇢ downstream
-│  └─ trigger-api     created  ▶ manual  ⇢ downstream
-└─ Deploy and Test [created]
-   ├─ deploy-staging  created
-   └─ smoke-tests     created  ▶ manual
+Results:
+  automated-testing    PASSED  https://gitlab.example.com/g/tests/-/pipelines/301
+                               triggered from https://gitlab.example.com/g/p/-/pipelines/201
+  helm-charts          PASSED  https://gitlab.example.com/g/helm/-/pipelines/402
+                               triggered from https://gitlab.example.com/g/p/-/pipelines/202 (after 1 new push(es))
 ```
+
+If you stop babysit (Ctrl-C) mid-run, held jobs it canceled stay canceled. It prints the pipeline link so you can retry them by hand.
 
 ## Development
 

@@ -1,6 +1,6 @@
-// Package babysit drives the automated-testing pipeline to green: it triggers
-// the test job, holds back clean-up jobs, and retries failures until the
-// setup and test-case stages pass.
+// Package babysit drives triggered test pipelines to green: it triggers the
+// job that creates the pipeline, holds back clean-up jobs, retries failures
+// until everything passes, then releases clean-up and waits for it to pass.
 package babysit
 
 import (
@@ -22,25 +22,41 @@ type API interface {
 	CancelJob(ctx context.Context, id string) error
 }
 
-// TestRun holds the settings for babysitting one automated-testing pipeline.
+// Spec describes one kind of triggered pipeline to babysit.
+type Spec struct {
+	Name          string                 // label for logs and results, e.g. "helm-charts"
+	TriggerStages []string               // stages of the main pipeline holding the trigger job
+	MatchJob      func(name string) bool // selects the trigger job
+	HoldStage     string                 // canceled until everything else passes, then released
+	NoRetryStages []string               // a failure here can't be fixed by retrying
+	Repush        bool                   // on such a failure, push a new commit and start over
+}
+
+// TestRun babysits one triggered pipeline according to Spec.
 type TestRun struct {
-	API          API
-	Interval     time.Duration
-	MaxRetries   int // per job name; 0 means retry forever
-	SetupStage   string
-	ExecuteStage string
-	CleanupStage string
-	Log          func(string) // receives one line per event; nil discards
+	API        API
+	Interval   time.Duration
+	MaxRetries int // per job name; 0 means retry forever
+	Spec       Spec
+	Log        func(string) // receives one line per event; nil discards
 
 	retries map[string]int
 }
 
-// FindTestJob returns the single job in p whose name ends with suffix.
-func FindTestJob(p *gitlab.Pipeline, suffix string) (gitlab.Job, error) {
+// Result is the outcome of Babysit.
+type Result struct {
+	Pipeline  *gitlab.Pipeline // last snapshot of the triggered pipeline
+	Passed    bool
+	FailedJob string // set when a job in a NoRetryStages stage failed
+}
+
+// FindJob returns the single job in stages of p for which match is true.
+func FindJob(p *gitlab.Pipeline, stages []string, match func(string) bool) (gitlab.Job, error) {
+	filtered, _ := gitlab.FilterStages(p, stages)
 	var found []gitlab.Job
-	for _, s := range p.Stages {
+	for _, s := range filtered.Stages {
 		for _, j := range s.Jobs {
-			if strings.HasSuffix(j.Name, suffix) {
+			if match(j.Name) {
 				found = append(found, j)
 			}
 		}
@@ -49,13 +65,13 @@ func FindTestJob(p *gitlab.Pipeline, suffix string) (gitlab.Job, error) {
 	case 1:
 		return found[0], nil
 	case 0:
-		return gitlab.Job{}, fmt.Errorf("no job ending in %q in pipeline #%s", suffix, p.IID)
+		return gitlab.Job{}, fmt.Errorf("no matching job in stage(s) %q of pipeline #%s", stages, p.IID)
 	default:
 		names := make([]string, len(found))
 		for i, j := range found {
 			names[i] = j.Name
 		}
-		return gitlab.Job{}, fmt.Errorf("multiple jobs end in %q: %q", suffix, names)
+		return gitlab.Job{}, fmt.Errorf("multiple matching jobs in pipeline #%s: %q", p.IID, names)
 	}
 }
 
@@ -64,6 +80,7 @@ func FindTestJob(p *gitlab.Pipeline, suffix string) (gitlab.Job, error) {
 // or canceled trigger job is retried; otherwise it waits for the job to
 // become playable.
 func (t *TestRun) Trigger(ctx context.Context, project, iid, jobName string) (*gitlab.PipelineRef, error) {
+	t.retries = map[string]int{}
 	lastStatus := ""
 	for {
 		p, err := t.API.GetPipeline(ctx, project, iid, 0)
@@ -84,7 +101,7 @@ func (t *TestRun) Trigger(ctx context.Context, project, iid, jobName string) (*g
 				if err := t.API.PlayJob(ctx, job.ID); err != nil {
 					return nil, err
 				}
-				t.log("triggered %s", jobName)
+				t.log("triggered %s in pipeline #%s", jobName, iid)
 			case job.Status == "failed" || job.Status == "canceled":
 				if err := t.retry(ctx, job, "trigger"); err != nil {
 					return nil, err
@@ -100,110 +117,179 @@ func (t *TestRun) Trigger(ctx context.Context, project, iid, jobName string) (*g
 	}
 }
 
-// holdable statuses are those a clean-up job can be canceled from before it
+// holdable statuses are those a held job can be canceled from before it
 // finishes. "manual" is excluded because such jobs never start on their own.
 var holdable = []string{"created", "waiting_for_resource", "preparing", "pending", "running", "scheduled"}
 
-// Babysit polls the test pipeline until every job in the setup and execute
-// stages has passed, canceling clean-up jobs in the meantime and retrying
-// failed jobs. Once everything passes it retries the canceled clean-up jobs
-// so they run.
-func (t *TestRun) Babysit(ctx context.Context, ref gitlab.PipelineRef) error {
-	lastSummary := ""
+// Babysit polls the triggered pipeline in three phases:
+//
+//  1. Running: cancel HoldStage jobs, retry failed/canceled jobs elsewhere,
+//     until every other stage passes or a NoRetryStages job fails.
+//  2. Release: retry the canceled HoldStage jobs so they run.
+//  3. Clean-up: retry failed HoldStage jobs until they all finish.
+//
+// A failure in a NoRetryStages stage still goes through release and clean-up,
+// so the environment is torn down, and returns Result.Passed == false.
+func (t *TestRun) Babysit(ctx context.Context, ref gitlab.PipelineRef) (*Result, error) {
+	t.retries = map[string]int{}
+	var (
+		res         *Result // non-nil once the outcome is decided
+		released    bool
+		lastSummary string
+		p           *gitlab.Pipeline
+	)
 	for {
-		p, err := t.API.GetPipeline(ctx, ref.Project, ref.IID, 0)
+		snap, err := t.API.GetPipeline(ctx, ref.Project, ref.IID, 0)
 		if err != nil {
 			if !gitlab.IsTransient(err) {
-				return err
+				return nil, err
 			}
 			t.log("transient error, retrying: %v", err)
 		} else {
+			p = snap
 			// Summarize before acting so the actions read as responses to it.
-			if s := t.summary(p); s != lastSummary {
+			if s := summary(p); s != lastSummary {
 				t.log("%s", s)
 				lastSummary = s
 			}
-			done, err := t.step(ctx, p)
-			if err != nil || done {
-				return err
+			hold, rest, err := t.split(p)
+			if err != nil {
+				return nil, err
+			}
+			switch {
+			case res == nil:
+				if res, err = t.running(ctx, p, hold, rest); err != nil {
+					return nil, err
+				}
+				if res != nil {
+					if err := t.release(ctx, hold); err != nil {
+						return nil, err
+					}
+					released = true
+				}
+			case released:
+				done, err := t.cleanup(ctx, hold)
+				if err != nil {
+					return nil, err
+				}
+				if done {
+					res.Pipeline = p
+					return res, nil
+				}
 			}
 		}
 		if err := t.sleep(ctx); err != nil {
-			return fmt.Errorf("%w; any %q jobs babysit canceled are still canceled, retry them from %s",
-				err, t.CleanupStage, testPipelineURL(p, ref))
+			if !released {
+				err = fmt.Errorf("%w; any %q jobs babysit canceled are still canceled, retry them from %s",
+					err, t.Spec.HoldStage, pipelineURL(p, ref))
+			}
+			return nil, err
 		}
 	}
 }
 
-// step does one pass over the pipeline. done is true once clean-up has been released.
-func (t *TestRun) step(ctx context.Context, p *gitlab.Pipeline) (done bool, err error) {
-	setup, execute, cleanup, err := t.stages(p)
-	if err != nil {
-		return false, err
-	}
-
-	if allPassed(setup) && allPassed(execute) {
-		for _, j := range cleanup.Jobs {
-			if j.Status == "canceled" {
-				if err := t.API.RetryJob(ctx, j.ID); err != nil {
-					return false, err
-				}
-				t.log("released %s job %s", cleanup.Name, j.Name)
+// running handles one poll before the outcome is known. It returns a non-nil
+// Result once every non-held stage passed or a no-retry job failed.
+func (t *TestRun) running(ctx context.Context, p *gitlab.Pipeline, hold *gitlab.Stage, rest []gitlab.Stage) (*Result, error) {
+	allPassed := true
+	for _, s := range rest {
+		noRetry := t.noRetry(s.Name)
+		for _, j := range s.Jobs {
+			if noRetry && (j.Status == "failed" || j.Status == "canceled") {
+				t.log("%s job %s %s; it can't pass by retrying %s", s.Name, j.Name, j.Status, j.WebURL)
+				return &Result{FailedJob: j.Name}, nil
 			}
+			allPassed = allPassed && j.Status == "success"
 		}
-		t.log("%s and %s passed; %s released", setup.Name, execute.Name, cleanup.Name)
-		return true, nil
+	}
+	if allPassed {
+		t.log("all stages except %s passed", t.Spec.HoldStage)
+		return &Result{Passed: true}, nil
 	}
 
-	// Hold clean-up first: it must not start while tests are still going.
-	// This runs every pass because retrying an earlier job makes GitLab
-	// reset skipped clean-up jobs back to "created".
-	for _, j := range cleanup.Jobs {
+	// Hold first: it must not start while other stages are still going. This
+	// runs every poll because retrying an earlier job makes GitLab reset
+	// skipped held jobs back to "created".
+	for _, j := range hold.Jobs {
 		if slices.Contains(holdable, j.Status) {
 			if err := t.API.CancelJob(ctx, j.ID); err != nil {
-				return false, err
+				return nil, err
 			}
-			t.log("holding %s job %s (canceled)", cleanup.Name, j.Name)
+			t.log("holding %s job %s (canceled)", hold.Name, j.Name)
 		}
 	}
-
-	for _, s := range []*gitlab.Stage{setup, execute} {
+	// Canceled jobs are retried too: babysit only cancels held jobs, so
+	// anything else canceled was interrupted (e.g. by auto-cancel on push).
+	for _, s := range rest {
 		for _, j := range s.Jobs {
-			if j.Status == "failed" {
+			if j.Status == "failed" || j.Status == "canceled" {
 				if err := t.retry(ctx, j, s.Name); err != nil {
-					return false, err
+					return nil, err
 				}
 			}
 		}
 	}
-	return false, nil
+	return nil, nil
 }
 
-func (t *TestRun) stages(p *gitlab.Pipeline) (setup, execute, cleanup *gitlab.Stage, err error) {
-	var missing []string
-	find := func(name string) *gitlab.Stage {
-		f, _ := gitlab.FilterStages(p, []string{name})
-		if len(f.Stages) == 0 {
-			missing = append(missing, name)
-			return nil
+func (t *TestRun) release(ctx context.Context, hold *gitlab.Stage) error {
+	for _, j := range hold.Jobs {
+		if j.Status == "canceled" {
+			if err := t.API.RetryJob(ctx, j.ID); err != nil {
+				return err
+			}
+			t.log("released %s job %s", hold.Name, j.Name)
 		}
-		return &f.Stages[0]
 	}
-	setup, execute, cleanup = find(t.SetupStage), find(t.ExecuteStage), find(t.CleanupStage)
-	if len(missing) > 0 {
-		return nil, nil, nil, fmt.Errorf("test pipeline #%s has no stage(s) %q; available: %q",
-			p.IID, missing, gitlab.AllStageNames(p))
+	return nil
+}
+
+// cleanup retries failed held jobs and reports whether they have all finished.
+// skipped and manual count as finished: GitLab will never run them on its own.
+func (t *TestRun) cleanup(ctx context.Context, hold *gitlab.Stage) (done bool, err error) {
+	done = true
+	for _, j := range hold.Jobs {
+		switch j.Status {
+		case "success", "skipped", "manual":
+		case "failed", "canceled":
+			if err := t.retry(ctx, j, hold.Name); err != nil {
+				return false, err
+			}
+			done = false
+		default:
+			done = false
+		}
 	}
-	return setup, execute, cleanup, nil
+	if done {
+		t.log("%s finished", hold.Name)
+	}
+	return done, nil
+}
+
+// split returns the held stage and all other stages of p.
+func (t *TestRun) split(p *gitlab.Pipeline) (hold *gitlab.Stage, rest []gitlab.Stage, err error) {
+	f, _ := gitlab.FilterStages(p, []string{t.Spec.HoldStage})
+	if len(f.Stages) == 0 {
+		return nil, nil, fmt.Errorf("%s pipeline #%s has no %q stage; available: %q",
+			t.Spec.Name, p.IID, t.Spec.HoldStage, gitlab.AllStageNames(p))
+	}
+	hold = &f.Stages[0]
+	for _, s := range p.Stages {
+		if s.Name != hold.Name {
+			rest = append(rest, s)
+		}
+	}
+	return hold, rest, nil
+}
+
+func (t *TestRun) noRetry(stage string) bool {
+	return slices.ContainsFunc(t.Spec.NoRetryStages, func(n string) bool { return gitlab.SameStage(n, stage) })
 }
 
 // ErrTooManyRetries is returned when a job keeps failing past MaxRetries.
 var ErrTooManyRetries = errors.New("too many retries")
 
 func (t *TestRun) retry(ctx context.Context, j gitlab.Job, stage string) error {
-	if t.retries == nil {
-		t.retries = map[string]int{}
-	}
 	n := t.retries[j.Name] + 1
 	if t.MaxRetries > 0 && n > t.MaxRetries {
 		return fmt.Errorf("%w: %s job %s failed %d times (%s)", ErrTooManyRetries, stage, j.Name, n, j.WebURL)
@@ -212,11 +298,11 @@ func (t *TestRun) retry(ctx context.Context, j gitlab.Job, stage string) error {
 		return err
 	}
 	t.retries[j.Name] = n
-	t.log("retrying %s job %s (retry #%d) %s", stage, j.Name, n, j.WebURL)
+	t.log("retrying %s job %s (%s, retry #%d) %s", stage, j.Name, j.Status, n, j.WebURL)
 	return nil
 }
 
-func (t *TestRun) summary(p *gitlab.Pipeline) string {
+func summary(p *gitlab.Pipeline) string {
 	var parts []string
 	for _, s := range p.Stages {
 		counts := map[string]int{}
@@ -238,15 +324,6 @@ func (t *TestRun) summary(p *gitlab.Pipeline) string {
 	return strings.Join(parts, " | ")
 }
 
-func allPassed(s *gitlab.Stage) bool {
-	for _, j := range s.Jobs {
-		if j.Status != "success" {
-			return false
-		}
-	}
-	return true
-}
-
 func findJob(p *gitlab.Pipeline, name string) (gitlab.Job, bool) {
 	for _, s := range p.Stages {
 		for _, j := range s.Jobs {
@@ -258,7 +335,7 @@ func findJob(p *gitlab.Pipeline, name string) (gitlab.Job, bool) {
 	return gitlab.Job{}, false
 }
 
-func testPipelineURL(p *gitlab.Pipeline, ref gitlab.PipelineRef) string {
+func pipelineURL(p *gitlab.Pipeline, ref gitlab.PipelineRef) string {
 	if p != nil && p.WebURL != "" {
 		return p.WebURL
 	}

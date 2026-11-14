@@ -35,3 +35,8 @@ func normalizeStage(s string) string {
 	s = strings.NewReplacer("-", " ", "_", " ").Replace(s)
 	return strings.Join(strings.Fields(s), " ")
 }
+
+// SameStage reports whether two stage names match under FilterStages' rules.
+func SameStage(a, b string) bool {
+	return normalizeStage(a) == normalizeStage(b)
+}

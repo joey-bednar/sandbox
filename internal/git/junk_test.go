@@ -120,3 +120,29 @@ func TestDefaultBase(t *testing.T) {
 		t.Fatalf("got %q, %v", got, err)
 	}
 }
+
+func TestCommitJunkChangeLeavesOtherStagedChanges(t *testing.T) {
+	dir, repo := setupBranch(t)
+	write(t, dir, "staged.txt", "user work\n")
+	gitRun(t, dir, "add", "staged.txt")
+	gitRun(t, dir, "config", "user.name", "t")
+	gitRun(t, dir, "config", "user.email", "t@t")
+
+	path, _, err := repo.CommitJunkChange("main", "Get passing pipelines")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(path) != "a.txt" {
+		t.Fatalf("path = %s", path)
+	}
+	out, err := repo.output("show", "--name-only", "--format=%s", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "Get passing pipelines\n\na.txt" {
+		t.Errorf("HEAD = %q", out)
+	}
+	if staged, _ := repo.HasStagedChanges(); !staged {
+		t.Error("user's staged change should still be staged")
+	}
+}

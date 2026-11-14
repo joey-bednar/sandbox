@@ -4,86 +4,146 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/joey-bednar/sandbox/internal/gitlab"
 )
 
-// fakeAPI returns successive pipeline snapshots (repeating the last one) and
-// records every mutation as "play:<id>", "retry:<id>" or "cancel:<id>".
+// fakeAPI serves successive snapshots per pipeline IID (repeating the last
+// one) and records every mutation as "play:<id>", "retry:<id>" or "cancel:<id>".
 type fakeAPI struct {
-	snapshots []*gitlab.Pipeline
-	polls     int
+	mu        sync.Mutex
+	snapshots map[string][]*gitlab.Pipeline
+	polls     map[string]int
 	calls     []string
 }
 
-func (f *fakeAPI) GetPipeline(_ context.Context, _, _ string, _ int) (*gitlab.Pipeline, error) {
-	p := f.snapshots[min(f.polls, len(f.snapshots)-1)]
-	f.polls++
+func newFake(snaps map[string][]*gitlab.Pipeline) *fakeAPI {
+	return &fakeAPI{snapshots: snaps, polls: map[string]int{}}
+}
+
+func (f *fakeAPI) GetPipeline(_ context.Context, _, iid string, _ int) (*gitlab.Pipeline, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s := f.snapshots[iid]
+	p := s[min(f.polls[iid], len(s)-1)]
+	f.polls[iid]++
 	return p, nil
 }
-func (f *fakeAPI) PlayJob(_ context.Context, id string) error {
-	f.calls = append(f.calls, "play:"+id)
+func (f *fakeAPI) record(c string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, c)
 	return nil
 }
-func (f *fakeAPI) RetryJob(_ context.Context, id string) error {
-	f.calls = append(f.calls, "retry:"+id)
-	return nil
-}
-func (f *fakeAPI) CancelJob(_ context.Context, id string) error {
-	f.calls = append(f.calls, "cancel:"+id)
-	return nil
-}
+func (f *fakeAPI) PlayJob(_ context.Context, id string) error   { return f.record("play:" + id) }
+func (f *fakeAPI) RetryJob(_ context.Context, id string) error  { return f.record("retry:" + id) }
+func (f *fakeAPI) CancelJob(_ context.Context, id string) error { return f.record("cancel:" + id) }
 
 func job(id, status string) gitlab.Job { return gitlab.Job{ID: id, Name: id, Status: status} }
 
-func testPipeline(setup, execute, cleanup []gitlab.Job) *gitlab.Pipeline {
-	return &gitlab.Pipeline{IID: "9", Stages: []gitlab.Stage{
-		{Name: "Setup", Jobs: setup},
-		{Name: "Execute Test Cases", Jobs: execute},
-		{Name: "Clean Up", Jobs: cleanup},
-	}}
+func stage(name string, jobs ...gitlab.Job) gitlab.Stage { return gitlab.Stage{Name: name, Jobs: jobs} }
+
+func pipeline(iid string, stages ...gitlab.Stage) *gitlab.Pipeline {
+	return &gitlab.Pipeline{IID: iid, Project: "g/t", WebURL: "https://gl/p/" + iid, Stages: stages}
 }
 
-func newRun(api API) *TestRun {
-	return &TestRun{
-		API: api, Interval: time.Millisecond,
-		SetupStage: "setup", ExecuteStage: "execute test cases", CleanupStage: "clean up",
-	}
+var testsSpec = Spec{
+	Name:          "automated-testing",
+	TriggerStages: []string{"Monorepo Triggers", "Deploy and Test"},
+	MatchJob:      func(n string) bool { return strings.HasSuffix(n, "-automated-testing") },
+	HoldStage:     "clean up",
 }
 
-func TestBabysitHoldsCleanupRetriesAndReleases(t *testing.T) {
-	api := &fakeAPI{snapshots: []*gitlab.Pipeline{
+var helmSpec = Spec{
+	Name:          "helm-charts",
+	TriggerStages: []string{"Deploy and Test"},
+	MatchJob:      func(n string) bool { return n == "helm-charts" },
+	HoldStage:     "Post Clean Up",
+	NoRetryStages: []string{"deploy"},
+	Repush:        true,
+}
+
+func newRun(api API, spec Spec) *TestRun {
+	return &TestRun{API: api, Interval: time.Millisecond, Spec: spec}
+}
+
+func tests(iid string, setup, execute, cleanup []gitlab.Job) *gitlab.Pipeline {
+	return pipeline(iid, stage("Setup", setup...), stage("Execute Test Cases", execute...), stage("Clean Up", cleanup...))
+}
+
+func TestBabysitHoldsRetriesReleasesAndWaitsForCleanup(t *testing.T) {
+	api := newFake(map[string][]*gitlab.Pipeline{"9": {
 		// setup failed: hold clean-up, retry setup
-		testPipeline([]gitlab.Job{job("s1", "failed"), job("s2", "success")},
+		tests("9", []gitlab.Job{job("s1", "failed"), job("s2", "success")},
 			[]gitlab.Job{job("e1", "skipped")}, []gitlab.Job{job("c1", "created"), job("c2", "manual")}),
 		// setup passed, a test case failed; GitLab reset clean-up to created again
-		testPipeline([]gitlab.Job{job("s1b", "success"), job("s2", "success")},
+		tests("9", []gitlab.Job{job("s1b", "success"), job("s2", "success")},
 			[]gitlab.Job{job("e1", "failed")}, []gitlab.Job{job("c1", "created"), job("c2", "manual")}),
-		// test case rerunning: nothing to do
-		testPipeline([]gitlab.Job{job("s1b", "success"), job("s2", "success")},
-			[]gitlab.Job{job("e1b", "running")}, []gitlab.Job{job("c1", "canceled"), job("c2", "manual")}),
+		// a test case was canceled by someone else: retry it too
+		tests("9", []gitlab.Job{job("s1b", "success"), job("s2", "success")},
+			[]gitlab.Job{job("e1b", "canceled")}, []gitlab.Job{job("c1", "canceled"), job("c2", "manual")}),
 		// all passed: release clean-up
-		testPipeline([]gitlab.Job{job("s1b", "success"), job("s2", "success")},
-			[]gitlab.Job{job("e1b", "success")}, []gitlab.Job{job("c1", "canceled"), job("c2", "manual")}),
-	}}
-	if err := newRun(api).Babysit(context.Background(), gitlab.PipelineRef{Project: "g/t", IID: "9"}); err != nil {
+		tests("9", []gitlab.Job{job("s1b", "success"), job("s2", "success")},
+			[]gitlab.Job{job("e1c", "success")}, []gitlab.Job{job("c1", "canceled"), job("c2", "manual")}),
+		// clean-up failed once: retry it
+		tests("9", []gitlab.Job{job("s1b", "success"), job("s2", "success")},
+			[]gitlab.Job{job("e1c", "success")}, []gitlab.Job{job("c1b", "failed"), job("c2", "manual")}),
+		// clean-up passed (manual job counts as finished)
+		tests("9", []gitlab.Job{job("s1b", "success"), job("s2", "success")},
+			[]gitlab.Job{job("e1c", "success")}, []gitlab.Job{job("c1c", "success"), job("c2", "manual")}),
+	}})
+	res, err := newRun(api, testsSpec).Babysit(context.Background(), gitlab.PipelineRef{Project: "g/t", IID: "9"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"cancel:c1", "retry:s1", "cancel:c1", "retry:e1", "retry:c1"}
+	if !res.Passed {
+		t.Fatalf("result = %+v", res)
+	}
+	want := []string{"cancel:c1", "retry:s1", "cancel:c1", "retry:e1", "retry:e1b", "retry:c1", "retry:c1b"}
 	if !slices.Equal(api.calls, want) {
 		t.Errorf("calls = %v, want %v", api.calls, want)
 	}
 }
 
+func helm(iid, deploy string, cleanup ...gitlab.Job) *gitlab.Pipeline {
+	return pipeline(iid,
+		stage("Build", job("build-"+iid, "success")),
+		stage("Deploy", job("deploy-"+iid, deploy)),
+		stage("Verify", job("verify-"+iid, map[string]string{"failed": "skipped", "success": "success"}[deploy])),
+		stage("Post Clean Up", cleanup...))
+}
+
+func TestBabysitNoRetryStageFailureCleansUpAndFails(t *testing.T) {
+	api := newFake(map[string][]*gitlab.Pipeline{"5": {
+		helm("5", "running", job("pc", "created")),
+		helm("5", "failed", job("pc", "canceled")),
+		helm("5", "failed", job("pc2", "running")),
+		helm("5", "failed", job("pc2", "success")),
+	}})
+	res, err := newRun(api, helmSpec).Babysit(context.Background(), gitlab.PipelineRef{IID: "5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Passed || res.FailedJob != "deploy-5" {
+		t.Fatalf("result = %+v", res)
+	}
+	// Deploy is never retried; clean-up is held, then released.
+	if want := []string{"cancel:pc", "retry:pc"}; !slices.Equal(api.calls, want) {
+		t.Errorf("calls = %v, want %v", api.calls, want)
+	}
+}
+
 func TestBabysitGivesUpAfterMaxRetries(t *testing.T) {
-	api := &fakeAPI{snapshots: []*gitlab.Pipeline{
-		testPipeline([]gitlab.Job{job("s1", "failed")}, nil, nil),
-	}}
-	run := newRun(api)
+	api := newFake(map[string][]*gitlab.Pipeline{"9": {
+		tests("9", []gitlab.Job{job("s1", "failed")}, nil, nil),
+	}})
+	run := newRun(api, testsSpec)
 	run.MaxRetries = 2
-	err := run.Babysit(context.Background(), gitlab.PipelineRef{Project: "g/t", IID: "9"})
+	_, err := run.Babysit(context.Background(), gitlab.PipelineRef{IID: "9"})
 	if !errors.Is(err, ErrTooManyRetries) {
 		t.Fatalf("err = %v", err)
 	}
@@ -92,37 +152,45 @@ func TestBabysitGivesUpAfterMaxRetries(t *testing.T) {
 	}
 }
 
-func TestBabysitMissingStage(t *testing.T) {
-	api := &fakeAPI{snapshots: []*gitlab.Pipeline{{IID: "9", Stages: []gitlab.Stage{{Name: "Setup"}}}}}
-	err := newRun(api).Babysit(context.Background(), gitlab.PipelineRef{})
-	if err == nil {
+func TestBabysitMissingHoldStage(t *testing.T) {
+	api := newFake(map[string][]*gitlab.Pipeline{"9": {pipeline("9", stage("Setup"))}})
+	if _, err := newRun(api, testsSpec).Babysit(context.Background(), gitlab.PipelineRef{IID: "9"}); err == nil {
 		t.Fatal("expected error")
 	}
 }
 
-func TestBabysitInterruptedMentionsHeldCleanup(t *testing.T) {
-	api := &fakeAPI{snapshots: []*gitlab.Pipeline{
-		testPipeline([]gitlab.Job{job("s1", "running")}, nil, []gitlab.Job{job("c1", "canceled")}),
-	}}
+func TestBabysitInterruptedMentionsHeldStage(t *testing.T) {
+	api := newFake(map[string][]*gitlab.Pipeline{"9": {
+		tests("9", []gitlab.Job{job("s1", "running")}, nil, []gitlab.Job{job("c1", "canceled")}),
+	}})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	err := newRun(api).Babysit(ctx, gitlab.PipelineRef{Project: "g/t", IID: "9"})
-	if !errors.Is(err, context.DeadlineExceeded) {
+	_, err := newRun(api, testsSpec).Babysit(ctx, gitlab.PipelineRef{IID: "9"})
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "still canceled") {
 		t.Fatalf("err = %v", err)
 	}
 }
 
-func TestTriggerPlaysManualJobAndReturnsDownstream(t *testing.T) {
-	main := func(status string, ds *gitlab.PipelineRef) *gitlab.Pipeline {
-		return &gitlab.Pipeline{IID: "1", Stages: []gitlab.Stage{{Name: "Deploy and Test", Jobs: []gitlab.Job{
-			{ID: "b1", Name: "web-automated-testing", Status: status, Bridge: true, DownstreamRef: ds},
-		}}}}
-	}
-	ref := &gitlab.PipelineRef{Project: "g/t", IID: "9"}
-	api := &fakeAPI{snapshots: []*gitlab.Pipeline{
-		main("created", nil), main("manual", nil), main("pending", nil), main("running", ref),
+func mainPipeline(iid string, jobs ...gitlab.Job) *gitlab.Pipeline {
+	return &gitlab.Pipeline{IID: iid, Project: "g/p", WebURL: "https://gl/main/" + iid, Stages: []gitlab.Stage{
+		stage("Monorepo Triggers", job("trigger-web", "success")),
+		stage("Deploy and Test", jobs...),
 	}}
-	got, err := newRun(api).Trigger(context.Background(), "g/p", "1", "web-automated-testing")
+}
+
+func bridge(id, name, status string, ds *gitlab.PipelineRef) gitlab.Job {
+	return gitlab.Job{ID: id, Name: name, Status: status, Bridge: true, DownstreamRef: ds}
+}
+
+func TestTriggerPlaysManualJobAndReturnsDownstream(t *testing.T) {
+	ref := &gitlab.PipelineRef{Project: "g/t", IID: "9"}
+	m := func(status string, ds *gitlab.PipelineRef) *gitlab.Pipeline {
+		return mainPipeline("1", bridge("b1", "web-automated-testing", status, ds))
+	}
+	api := newFake(map[string][]*gitlab.Pipeline{"1": {
+		m("created", nil), m("manual", nil), m("pending", nil), m("running", ref),
+	}})
+	got, err := newRun(api, testsSpec).Trigger(context.Background(), "g/p", "1", "web-automated-testing")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,20 +202,79 @@ func TestTriggerPlaysManualJobAndReturnsDownstream(t *testing.T) {
 	}
 }
 
-func TestFindTestJob(t *testing.T) {
-	p := &gitlab.Pipeline{IID: "1", Stages: []gitlab.Stage{
-		{Name: "Monorepo Triggers", Jobs: []gitlab.Job{job("web", "manual")}},
-		{Name: "Deploy and Test", Jobs: []gitlab.Job{job("web-automated-testing", "manual")}},
-	}}
-	j, err := FindTestJob(p, "-automated-testing")
+func TestFindJob(t *testing.T) {
+	p := mainPipeline("1", job("web-automated-testing", "manual"), job("helm-charts", "manual"))
+	j, err := FindJob(p, testsSpec.TriggerStages, testsSpec.MatchJob)
 	if err != nil || j.Name != "web-automated-testing" {
 		t.Fatalf("job = %+v, err = %v", j, err)
 	}
-	if _, err := FindTestJob(p, "-nope"); err == nil {
+	if j, err := FindJob(p, helmSpec.TriggerStages, helmSpec.MatchJob); err != nil || j.Name != "helm-charts" {
+		t.Fatalf("job = %+v, err = %v", j, err)
+	}
+	// helm-charts outside "Deploy and Test" doesn't count.
+	if _, err := FindJob(p, []string{"Monorepo Triggers"}, helmSpec.MatchJob); err == nil {
 		t.Error("expected not-found error")
 	}
 	p.Stages[0].Jobs = append(p.Stages[0].Jobs, job("api-automated-testing", "manual"))
-	if _, err := FindTestJob(p, "-automated-testing"); err == nil {
+	if _, err := FindJob(p, testsSpec.TriggerStages, testsSpec.MatchJob); err == nil {
 		t.Error("expected ambiguity error")
+	}
+}
+
+// Tests pass in main pipeline 1 while helm-charts' Deploy fails there, so helm
+// pushes a new commit and passes in main pipeline 2.
+func TestCoordinatorRepushesOnlyFailingSpec(t *testing.T) {
+	testsRef := &gitlab.PipelineRef{Project: "g/t", IID: "t1"}
+	helm1 := &gitlab.PipelineRef{Project: "g/h", IID: "h1"}
+	helm2 := &gitlab.PipelineRef{Project: "g/h", IID: "h2"}
+	main1 := mainPipeline("1",
+		bridge("bt", "web-automated-testing", "manual", nil), bridge("bh1", "helm-charts", "manual", nil))
+	main2 := mainPipeline("2",
+		bridge("bt2", "web-automated-testing", "manual", nil), bridge("bh2", "helm-charts", "manual", nil))
+
+	api := newFake(map[string][]*gitlab.Pipeline{
+		"1": {mainPipeline("1",
+			bridge("bt", "web-automated-testing", "running", testsRef), bridge("bh1", "helm-charts", "running", helm1))},
+		"2": {mainPipeline("2",
+			bridge("bt2", "web-automated-testing", "manual", nil), bridge("bh2", "helm-charts", "running", helm2))},
+		"t1": {tests("t1", []gitlab.Job{job("s", "success")}, []gitlab.Job{job("e", "success")}, []gitlab.Job{job("c", "success")})},
+		"h1": {helm("h1", "failed", job("pc1", "skipped"))},
+		"h2": {helm("h2", "success", job("pc2", "success"))},
+	})
+	pushes := 0
+	c := &Coordinator{
+		API: api, Interval: time.Millisecond, MaxPushes: 3,
+		NewPipeline: func(context.Context) (*gitlab.Pipeline, error) { pushes++; return main2, nil },
+	}
+	out := c.Run(context.Background(), main1, []Spec{testsSpec, helmSpec})
+
+	if out[0].Err != nil || out[0].Pipeline.IID != "t1" || out[0].Main.IID != "1" || out[0].Pushes != 0 {
+		t.Errorf("tests outcome = %+v", out[0])
+	}
+	if out[1].Err != nil || out[1].Pipeline.IID != "h2" || out[1].Main.IID != "2" || out[1].Pushes != 1 {
+		t.Errorf("helm outcome = %+v", out[1])
+	}
+	if pushes != 1 {
+		t.Errorf("pushes = %d", pushes)
+	}
+	if slices.Contains(api.calls, "play:bt2") {
+		t.Error("automated-testing should not be re-triggered in the new pipeline")
+	}
+}
+
+func TestCoordinatorStopsAfterMaxPushes(t *testing.T) {
+	h := &gitlab.PipelineRef{Project: "g/h", IID: "h1"}
+	main1 := mainPipeline("1", bridge("bh", "helm-charts", "running", h))
+	api := newFake(map[string][]*gitlab.Pipeline{
+		"1":  {main1},
+		"h1": {helm("h1", "failed", job("pc", "skipped"))},
+	})
+	c := &Coordinator{
+		API: api, Interval: time.Millisecond, MaxPushes: 2,
+		NewPipeline: func(context.Context) (*gitlab.Pipeline, error) { return main1, nil },
+	}
+	out := c.Run(context.Background(), main1, []Spec{helmSpec})
+	if !errors.Is(out[0].Err, ErrMaxPushes) || out[0].Pushes != 2 {
+		t.Fatalf("outcome = %+v", out[0])
 	}
 }

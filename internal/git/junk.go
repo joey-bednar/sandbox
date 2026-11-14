@@ -53,11 +53,34 @@ func (r *Repo) hasUncommittedChanges(path string) (bool, error) {
 	return out != "", err
 }
 
-// StageJunkChange picks the first file changed on this branch since base
-// that has no uncommitted edits and is not binary, toggles its trailing
-// newline (removes it if present, adds one otherwise) and stages it.
+// StageJunkChange makes a junk change (see editJunk) and stages it.
 // It returns the file and whether a newline was added.
 func (r *Repo) StageJunkChange(base string) (path string, added bool, err error) {
+	if path, added, err = r.editJunk(base); err != nil {
+		return "", false, err
+	}
+	if _, err := r.output("add", "--", path); err != nil {
+		return "", false, err
+	}
+	return path, added, nil
+}
+
+// CommitJunkChange makes a junk change (see editJunk) and commits only that
+// file, leaving anything else that happens to be staged untouched.
+func (r *Repo) CommitJunkChange(base, msg string) (path string, added bool, err error) {
+	if path, added, err = r.editJunk(base); err != nil {
+		return "", false, err
+	}
+	if err := r.stream("commit", "--only", "-m", msg, "--", path); err != nil {
+		return "", false, err
+	}
+	return path, added, nil
+}
+
+// editJunk picks the first file changed on this branch since base that has
+// no uncommitted edits and is not binary, and toggles its trailing newline
+// (removes it if present, adds one otherwise) in the work tree.
+func (r *Repo) editJunk(base string) (path string, added bool, err error) {
 	files, err := r.BranchFiles(base)
 	if err != nil {
 		return "", false, err
@@ -88,9 +111,6 @@ func (r *Repo) StageJunkChange(base string) (path string, added bool, err error)
 			return "", false, err
 		}
 		if err := os.WriteFile(f, data, info.Mode().Perm()); err != nil {
-			return "", false, err
-		}
-		if _, err := r.output("add", "--", f); err != nil {
 			return "", false, err
 		}
 		return f, added, nil
