@@ -185,6 +185,8 @@ func run(ctx context.Context, o options) error {
 			return pushForNewPipeline(ctx, repo, client, branch, project, o, d)
 		},
 		Log: d.Log,
+		// Pipelines triggered from here are shown and their failures retried.
+		WatchStage: "Monorepo Triggers",
 	}
 	if d.Live() {
 		coord.Observe = d.Observe

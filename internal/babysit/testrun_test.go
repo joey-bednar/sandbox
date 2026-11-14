@@ -527,3 +527,97 @@ func TestBabysitFailsWithoutUpgradeJob(t *testing.T) {
 		t.Errorf("calls = %v", api.calls)
 	}
 }
+
+func TestWatchRetriesFailedJobsUntilPassed(t *testing.T) {
+	optional := job("opt", "manual")
+	optional.AllowFailure = true
+	api := newFake(map[string][]*gitlab.Pipeline{"8": {
+		pipeline("8", stage("build", job("b", "running")), stage("test", job("u", "created"), optional)),
+		pipeline("8", stage("build", job("b", "failed")), stage("test", job("u", "created"), optional)),
+		pipeline("8", stage("build", job("b", "success")), stage("test", job("u", "failed"), optional)),
+		pipeline("8", stage("build", job("b", "success")), stage("test", job("u", "success"), optional)),
+	}})
+	p, err := newRun(api, Spec{Name: "lib"}).Watch(context.Background(), gitlab.PipelineRef{IID: "8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.IID != "8" {
+		t.Fatalf("pipeline = %+v", p)
+	}
+	if want := []string{"retry:b", "retry:u"}; !slices.Equal(api.calls, want) {
+		t.Errorf("calls = %v, want %v", api.calls, want)
+	}
+}
+
+func TestWatchStopsWhenStuck(t *testing.T) {
+	for name, stuck := range map[string]gitlab.Job{
+		"canceled":        job("c", "canceled"),
+		"blocking manual": job("m", "manual"),
+	} {
+		api := newFake(map[string][]*gitlab.Pipeline{"8": {
+			pipeline("8", stage("build", job("b", "success"), stuck)),
+		}})
+		_, err := newRun(api, Spec{Name: "lib"}).Watch(context.Background(), gitlab.PipelineRef{IID: "8"})
+		if err == nil || !strings.Contains(err.Error(), "can't pass by retrying") {
+			t.Errorf("%s: err = %v", name, err)
+		}
+		if len(api.calls) != 0 {
+			t.Errorf("%s: calls = %v", name, api.calls)
+		}
+	}
+}
+
+func TestCoordinatorWatchesTriggeredDownstreamPipelines(t *testing.T) {
+	bridge := func(id, status, iid string) gitlab.Job {
+		j := gitlab.Job{ID: id, Name: id, Status: status, Bridge: true}
+		if iid != "" {
+			j.DownstreamRef = &gitlab.PipelineRef{Project: "g/" + id, IID: iid}
+		}
+		return j
+	}
+	main := pipeline("1",
+		stage("Monorepo Triggers",
+			bridge("x-automated-testing", "manual", ""),
+			bridge("lib-a", "success", "20"),
+			bridge("lib-manual", "manual", "")),
+	)
+	afterPlay := pipeline("1",
+		stage("Monorepo Triggers",
+			bridge("x-automated-testing", "success", "9"),
+			bridge("lib-a", "success", "20"),
+			bridge("lib-manual", "manual", "")),
+	)
+	api := newFake(map[string][]*gitlab.Pipeline{
+		"1": {main, afterPlay},
+		"9": {
+			tests("9", []gitlab.Job{job("s", "running")}, []gitlab.Job{job("e", "created")}, []gitlab.Job{job("c", "created")}),
+			tests("9", []gitlab.Job{job("s", "success")}, []gitlab.Job{job("e", "running")}, []gitlab.Job{job("c", "canceled")}),
+			tests("9", []gitlab.Job{job("s", "success")}, []gitlab.Job{job("e", "success")}, []gitlab.Job{job("c", "canceled")}),
+			tests("9", []gitlab.Job{job("s", "success")}, []gitlab.Job{job("e", "success")}, []gitlab.Job{job("c", "success")}),
+		},
+		"20": {
+			pipeline("20", stage("build", job("a1", "failed"))),
+			pipeline("20", stage("build", job("a1", "running"))),
+			pipeline("20", stage("build", job("a1", "success"))),
+		},
+	})
+	var mu sync.Mutex
+	seen := map[string]bool{}
+	c := &Coordinator{API: api, Interval: time.Millisecond, WatchStage: "monorepo triggers",
+		Observe: func(name string, _ Status) { mu.Lock(); seen[name] = true; mu.Unlock() }}
+	out := c.Run(context.Background(), main, []Spec{testsSpec})
+	if len(out) != 2 || out[0].Spec.Name != "automated-testing" || out[1].Spec.Name != "lib-a" {
+		t.Fatalf("outcomes = %+v", out)
+	}
+	for _, o := range out {
+		if o.Err != nil || o.Pipeline == nil {
+			t.Errorf("%s: %+v", o.Spec.Name, o)
+		}
+	}
+	if seen["lib-manual"] || seen["x-automated-testing"] || !seen["lib-a"] {
+		t.Errorf("observed sections = %v", seen)
+	}
+	if !slices.Contains(api.calls, "retry:a1") {
+		t.Errorf("calls = %v, want retry:a1", api.calls)
+	}
+}

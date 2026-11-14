@@ -97,6 +97,8 @@ Each triggered pipeline goes through the same steps. On every poll:
 3. **Release:** once every other stage has passed, retry the canceled held jobs so they run. "Passed" follows GitLab's UI: a stage passes when its jobs succeeded, were skipped, or are optional manual jobs. If a manual job that GitLab requires someone to play is in the way, babysit says so and waits; it never plays those.
 4. **Clean up:** retry failed held jobs until they all finish. The pipeline then counts as passed.
 
+**Other Monorepo Triggers pipelines.** babysit also watches every other pipeline triggered from the main pipeline's "Monorepo Triggers" stage. Each one gets its own dashboard section named after its trigger job. It is shown only once the trigger job has run and created its pipeline; ones still waiting to be played are not shown, and babysit never plays them. New ones are picked up while babysit runs. In these pipelines babysit retries every failed job until all jobs pass. It doesn't hold anything back, and it leaves canceled jobs alone (someone or GitLab's auto-cancel did that on purpose). If a pipeline can't pass by retrying (a canceled job, or a manual job someone must play), babysit stops watching it and reports it as failed. babysit waits for these pipelines too, and lists them in the results.
+
 **helm-charts Deploy failures** can't be fixed by retrying. When one happens, babysit still releases Post Clean Up and waits for it, so the environment is torn down. Then it pushes a junk commit (see above; only that file is committed, so anything you've staged meanwhile is left alone), waits for the new main pipeline, and triggers helm-charts there. This repeats up to 5 times. automated-testing is not re-triggered; it keeps going (or stays done) in the pipeline it started in.
 
 At the end babysit prints the passing pipeline for each as a markdown list, ready to paste into the merge request. They may be from different commits:
@@ -106,7 +108,7 @@ At the end babysit prints the passing pipeline for each as a markdown list, read
 - Passing [helm-charts](https://gitlab.example.com/g/helm/-/pipelines/402)
 ```
 
-A spec that didn't pass is listed as `- Failed <name>: <reason>` instead.
+Watched Monorepo Triggers pipelines follow, under their trigger job's name. A pipeline that didn't pass is listed as `- Failed <name>: <reason>` instead.
 
 **GitLab 5xx errors on play/retry/cancel** don't stop babysit. GitLab sometimes applies the action and still answers 500, so babysit doesn't resend blindly. It re-reads the job's status 2s later and only acts again if the action didn't take effect. Error messages include GitLab's request ID, which an admin can look up in the server logs.
 

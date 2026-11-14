@@ -26,6 +26,11 @@ type Coordinator struct {
 	// Observe, if set, receives every Status change of every Spec,
 	// including a final PhasePassed or PhaseFailed.
 	Observe func(spec string, s Status)
+	// WatchStage, if set, is a stage of the main pipeline whose triggered
+	// pipelines (other than those Specs trigger) are watched and have their
+	// failed jobs retried; see TestRun.Watch. They are reported by trigger
+	// job name after the Specs.
+	WatchStage string
 
 	pushMu sync.Mutex
 }
@@ -43,7 +48,7 @@ type Outcome struct {
 var ErrMaxPushes = errors.New("too many new pushes")
 
 // Run babysits every spec concurrently, starting from main, and returns one
-// Outcome per spec in the same order.
+// Outcome per spec in the same order, followed by one per watched pipeline.
 func (c *Coordinator) Run(ctx context.Context, main *gitlab.Pipeline, specs []Spec) []Outcome {
 	out := make([]Outcome, len(specs))
 	var wg sync.WaitGroup
@@ -54,8 +59,15 @@ func (c *Coordinator) Run(ctx context.Context, main *gitlab.Pipeline, specs []Sp
 			out[i] = c.runOne(ctx, main, s)
 		}()
 	}
-	wg.Wait()
-	return out
+	if c.WatchStage == "" {
+		wg.Wait()
+		return out
+	}
+	specsDone := make(chan struct{})
+	go func() { wg.Wait(); close(specsDone) }()
+	watched := c.watchDownstream(ctx, main, specs, specsDone)
+	<-specsDone
+	return append(out, watched...)
 }
 
 func (c *Coordinator) runOne(ctx context.Context, main *gitlab.Pipeline, spec Spec) (o Outcome) {

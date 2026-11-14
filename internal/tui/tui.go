@@ -109,10 +109,14 @@ func (d *Dashboard) Writer(sectionName string) io.Writer {
 func (d *Dashboard) Observe(sectionName string, st babysit.Status) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if s := d.section(sectionName); s != nil {
-		s.status = st
-		d.redraw()
+	s := d.section(sectionName)
+	if s == nil {
+		// Sections for pipelines babysit only watches appear as they're found.
+		s = &section{name: sectionName}
+		d.sections = append(d.sections, s)
 	}
+	s.status = st
+	d.redraw()
 }
 
 // Close leaves full-screen mode and prints the final frame to the normal
